@@ -178,7 +178,8 @@ def run_crawl_and_notify():
 
 
 def compose_email(results: list[dict]) -> tuple[str, str]:
-    subject_parts = []
+    total_new = 0
+    has_error = False
     body_parts = []
 
     for result in results:
@@ -186,25 +187,24 @@ def compose_email(results: list[dict]) -> tuple[str, str]:
         status = result["status"]
 
         if status == "error":
-            subject_parts.append(f"[{site_name}] 异常")
+            has_error = True
             body_parts.append(f"【{site_name}】\n状态：异常\n{result['message']}\n")
         elif status == "normal":
-            subject_parts.append(f"[{site_name}] 正常")
             body_parts.append(f"【{site_name}】\n状态：正常\n{result['message']}\n")
         elif status == "update":
-            subject_parts.append(f"[{site_name}] {len(result['new_items'])}条新通知")
+            new_count = len(result["new_items"])
+            total_new += new_count
             items_text = "\n".join(
                 f"  {i}. {t}\n     {u}"
                 for i, (t, u) in enumerate(result["new_items"], 1)
             )
-            body_parts.append(
-                f"【{site_name}】\n状态：有新通知\n{result['message']}\n新增内容：\n{items_text}\n"
-            )
+            body_parts.append(f"【{site_name}】\n{items_text}\n")
         elif status == "not_initialized":
-            subject_parts.append(f"[{site_name}] 未初始化")
+            has_error = True
             body_parts.append(f"【{site_name}】\n状态：未初始化\n{result['message']}\n")
 
-    subject = "网站监控报告 - " + " | ".join(subject_parts)
+    status_text = "异常" if has_error else "正常"
+    subject = f"法规监控报告-{total_new}条新通知-程序运行状态{status_text}"
     body = "\n".join(body_parts)
 
     return subject, body
