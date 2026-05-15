@@ -1,9 +1,11 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
+import requests
 import schedule
 
 from db_manager import DatabaseManager
@@ -13,6 +15,7 @@ from site_crawlers import ALL_CRAWLERS
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 AUTOSTART_BAT_NAME = "crawl_monitor.bat"
+HTML_SAVE_DIR = os.path.join(SCRIPT_DIR, "downloaded_pages")
 
 
 def load_config() -> dict | None:
@@ -42,10 +45,13 @@ def interactive_setup() -> dict:
     smtp_port = input("SMTP端口 (默认: 465): ").strip() or "465"
     sender = input("发件人邮箱: ").strip()
     password = input("授权码 (非邮箱登录密码): ").strip()
-    receiver = input("收件人邮箱: ").strip()
 
-    if not sender or not password or not receiver:
-        print("错误: 邮箱和授权码不能为空")
+    print("\n收件人邮箱 (可输入多个，用逗号分隔):")
+    receiver_input = input("收件人邮箱: ").strip()
+    receivers = [r.strip() for r in receiver_input.split(",") if r.strip()]
+
+    if not sender or not password or not receivers:
+        print("错误: 发件人邮箱、授权码和收件人邮箱不能为空")
         sys.exit(1)
 
     print("\n--- 定时执行配置 ---")
@@ -65,6 +71,22 @@ def interactive_setup() -> dict:
 
     print("\n--- 开机自启动 ---")
     enable_autostart = input("是否启用开机自启动? (y/n, 默认: n): ").strip().lower() == "y"
+    autostart_mode = "console"
+    if enable_autostart:
+        print("自启动模式:")
+        print("  1. 控制台模式 (显示命令行窗口)")
+        print("  2. 静默模式 (不显示窗口)")
+        print("  3. 运行后确认关闭 (执行一次爬取，显示结果后按回车关闭)")
+        mode_choice = input("请选择 (1/2/3, 默认: 1): ").strip()
+        if mode_choice == "2":
+            autostart_mode = "silent"
+        elif mode_choice == "3":
+            autostart_mode = "run_once"
+        else:
+            autostart_mode = "console"
+
+    print("\n--- 附加功能 ---")
+    enable_download = input("是否启用新数据HTML页面下载? (y/n, 默认: n): ").strip().lower() == "y"
 
     config = {
         "email": {
@@ -72,7 +94,7 @@ def interactive_setup() -> dict:
             "smtp_port": int(smtp_port),
             "sender": sender,
             "password": password,
-            "receiver": receiver,
+            "receivers": receivers,
         },
         "schedule": {
             "enabled": enable_schedule,
@@ -80,11 +102,41 @@ def interactive_setup() -> dict:
             "interval_days": interval_days,
         },
         "autostart": enable_autostart,
+        "autostart_mode": autostart_mode,
+        "download_html": enable_download,
     }
 
     save_config(config)
     print("\n配置已保存到 config.json")
     return config
+
+
+def download_new_pages(new_items: list[tuple[str, str]], site_key: str):
+    if not new_items:
+        return
+
+    site_dir = os.path.join(HTML_SAVE_DIR, site_key)
+    os.makedirs(site_dir, exist_ok=True)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+    for title, url in new_items:
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            resp.encoding = resp.apparent_encoding
+
+            safe_title = re.sub(r'[\\/:*?"<>|]', "_", title[:80])
+            filename = f"{safe_title}.html"
+            filepath = os.path.join(site_dir, filename)
+
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(resp.text)
+
+            print(f"  已下载: {filename}")
+        except Exception as e:
+            print(f"  下载失败 [{title[:30]}]: {e}")
 
 
 def run_crawl_and_notify():
@@ -95,6 +147,7 @@ def run_crawl_and_notify():
 
     db = DatabaseManager()
     email = EmailSender(config["email"])
+    download_enabled = config.get("download_html", False)
 
     all_results = []
 
@@ -103,7 +156,7 @@ def run_crawl_and_notify():
         site_name = crawler.site_name
 
         if not db.is_initialized(site_key):
-            print(f"警告: [{site_name}] 尚未初始化记录，请先运行: python crawler.py init")
+            print(f"警告: [{site_name}] 尚未初始化记录，请先运行初始化")
             all_results.append(
                 {
                     "site_name": site_name,
@@ -165,6 +218,10 @@ def run_crawl_and_notify():
                     "new_items": new_items,
                 }
             )
+
+            if download_enabled:
+                print(f"\n[{site_name}] 下载新数据页面...")
+                download_new_pages(new_items, site_key)
 
     subject, body = compose_email(all_results)
 
@@ -261,7 +318,13 @@ def init_records():
     print("\n初始化完成!")
 
 
-def setup_autostart(enable: bool):
+def _get_exe_path() -> str:
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return sys.executable
+
+
+def setup_autostart(enable: bool, mode: str | None = None):
     startup_folder = os.path.join(
         os.environ.get("APPDATA", ""),
         "Microsoft",
@@ -273,18 +336,39 @@ def setup_autostart(enable: bool):
     bat_path = os.path.join(startup_folder, AUTOSTART_BAT_NAME)
 
     if enable:
-        python_exe = sys.executable
-        pythonw_exe = python_exe.replace("python.exe", "pythonw.exe")
-        exe_to_use = pythonw_exe if os.path.exists(pythonw_exe) else python_exe
-
-        with open(bat_path, "w") as f:
-            f.write(f'@echo off\nstart "" /min "{exe_to_use}" "{SCRIPT_DIR}\\crawler.py" start\n')
-
-        print(f"已添加开机自启动: {bat_path}")
-
         config = load_config()
+        if mode is None:
+            mode = config.get("autostart_mode", "console") if config else "console"
+
+        exe_path = _get_exe_path()
+
+        if getattr(sys, "frozen", False):
+            if mode == "silent":
+                bat_content = f'@echo off\nstart "" /min "{exe_path}" --autostart-run\n'
+            elif mode == "run_once":
+                bat_content = f'@echo off\n"{exe_path}" --autostart-run-once\npause\n'
+            else:
+                bat_content = f'@echo off\n"{exe_path}" --autostart-run\n'
+        else:
+            python_exe = sys.executable
+            if mode == "silent":
+                pythonw_exe = python_exe.replace("python.exe", "pythonw.exe")
+                exe_to_use = pythonw_exe if os.path.exists(pythonw_exe) else python_exe
+                bat_content = f'@echo off\nstart "" /min "{exe_to_use}" "{SCRIPT_DIR}\\crawler.py" --autostart-run\n'
+            elif mode == "run_once":
+                bat_content = f'@echo off\n"{python_exe}" "{SCRIPT_DIR}\\crawler.py" --autostart-run-once\npause\n'
+            else:
+                bat_content = f'@echo off\n"{python_exe}" "{SCRIPT_DIR}\\crawler.py" --autostart-run\n'
+
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(bat_content)
+
+        mode_names = {"console": "控制台模式", "silent": "静默模式", "run_once": "运行后确认关闭模式"}
+        print(f"已添加开机自启动 ({mode_names.get(mode, mode)}): {bat_path}")
+
         if config:
             config["autostart"] = True
+            config["autostart_mode"] = mode
             save_config(config)
     else:
         if os.path.exists(bat_path):
@@ -339,6 +423,7 @@ def test_compare_and_push():
 
     db = DatabaseManager()
     email = EmailSender(config["email"])
+    download_enabled = config.get("download_html", False)
 
     print("=" * 50)
     print("       测试比对与推送功能")
@@ -410,6 +495,10 @@ def test_compare_and_push():
                     "new_items": new_items,
                 }
             )
+
+            if download_enabled:
+                print(f"\n[{site_name}] 下载新数据页面...")
+                download_new_pages(new_items, site_key)
         else:
             print(f"\n[测试异常] 删除的记录未被识别为新记录")
             db.insert_records(site_key, [deleted_record])
@@ -527,7 +616,18 @@ def interactive_menu():
             input("\n按回车键继续...")
         elif num == 5:
             print("\n" + "-" * 40)
-            setup_autostart(True)
+            print("请选择自启动模式:")
+            print("  1. 控制台模式 (显示命令行窗口)")
+            print("  2. 静默模式 (不显示窗口)")
+            print("  3. 运行后确认关闭 (执行一次爬取，显示结果后按回车关闭)")
+            mode_choice = input("请选择 (1/2/3, 默认: 1): ").strip()
+            if mode_choice == "2":
+                mode = "silent"
+            elif mode_choice == "3":
+                mode = "run_once"
+            else:
+                mode = "console"
+            setup_autostart(True, mode)
             print("-" * 40)
             input("\n按回车键继续...")
         elif num == 6:
@@ -546,7 +646,16 @@ def interactive_menu():
 
 
 def main():
-    if len(sys.argv) > 1:
+    if "--autostart-run" in sys.argv:
+        start_scheduler()
+        return
+
+    if "--autostart-run-once" in sys.argv:
+        run_crawl_and_notify()
+        input("\n按回车键关闭程序...")
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] not in ["--autostart-run", "--autostart-run-once"]:
         parser = argparse.ArgumentParser(description="网站监控爬虫系统")
         subparsers = parser.add_subparsers(dest="command")
 
