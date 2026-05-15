@@ -135,8 +135,83 @@ class NhcGovCrawler(BaseCrawler):
             page.quit()
 
 
+class MeeGovGtfwSubCrawler(BaseCrawler):
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+    BASE_URL = "https://www.mee.gov.cn/ywgz/gtfwyhxpgl/"
+    SUB_PATH: str = ""
+
+    def crawl(self) -> list[tuple[str, str]]:
+        from urllib.parse import urljoin
+
+        url = self.BASE_URL + self.SUB_PATH
+        resp = requests.get(url, headers=self.HEADERS, timeout=15)
+        resp.encoding = resp.apparent_encoding
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        results = []
+        seen_urls = set()
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            title = a_tag.get_text(strip=True)
+            if not title:
+                continue
+            if not (href.endswith(".shtml") or href.endswith(".html") or href.endswith(".htm")):
+                continue
+            full_url = urljoin(url, href)
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            results.append((title, full_url))
+
+        return results
+
+
+class MeeGovGtfw_Crawler(MeeGovGtfwSubCrawler):
+    site_key = "mee_gov_gtfw"
+    site_name = "固体废物与化学品-固体废物"
+    SUB_PATH = "gtfw/"
+
+
+class MeeGovWxfw_Crawler(MeeGovGtfwSubCrawler):
+    site_key = "mee_gov_wxfw"
+    site_name = "固体废物与化学品-危险废物"
+    SUB_PATH = "wxfw/"
+
+
+class MeeGovHxphjgl_Crawler(MeeGovGtfwSubCrawler):
+    site_key = "mee_gov_hxphjgl"
+    site_name = "固体废物与化学品-化学品环境管理"
+    SUB_PATH = "hxphjgl/"
+
+
+class MeeGovZjshjgl_Crawler(MeeGovGtfwSubCrawler):
+    site_key = "mee_gov_zjshjgl"
+    site_name = "固体废物与化学品-重金属环境管理"
+    SUB_PATH = "zjshjgl/"
+
+
+class MeeGovGnlygz_Crawler(MeeGovGtfwSubCrawler):
+    site_key = "mee_gov_gnlygz"
+    site_name = "固体废物与化学品-国内履约工作"
+    SUB_PATH = "gnlygz/"
+
+
+class MeeGovFqdq_Crawler(MeeGovGtfwSubCrawler):
+    site_key = "mee_gov_fqdq"
+    site_name = "固体废物与化学品-废弃电器电子产品审核"
+    SUB_PATH = "fqdqdzcpcjclqksh/"
+
+
 ALL_CRAWLERS: list[BaseCrawler] = [
     MeeGovCrawler(),
     MeeGovGzkCrawler(),
     NhcGovCrawler(),
+    MeeGovGtfw_Crawler(),
+    MeeGovWxfw_Crawler(),
+    MeeGovHxphjgl_Crawler(),
+    MeeGovZjshjgl_Crawler(),
+    MeeGovGnlygz_Crawler(),
+    MeeGovFqdq_Crawler(),
 ]
