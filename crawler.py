@@ -11,6 +11,7 @@ import requests
 import schedule
 
 from db_manager import DatabaseManager, APP_DATA_DIR, ensure_app_data_dir, migrate_from_script_dir
+from deepseek_summarizer import process_new_items, test_api_key
 from email_sender import EmailSender
 from site_crawlers import ALL_CRAWLERS
 
@@ -22,16 +23,14 @@ HTML_SAVE_DIR = os.path.join(APP_DATA_DIR, "downloaded_pages")
 OLD_CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 OLD_HTML_SAVE_DIR = os.path.join(SCRIPT_DIR, "downloaded_pages")
 
-# 网络检测的目标网站
 PING_TARGETS = ["www.mee.gov.cn", "www.nhc.gov.cn"]
 
 
 def check_network_available(host, timeout=2):
-    """检测目标主机是否可连接"""
     try:
         socket.setdefaulttimeout(timeout)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        port = 443  # HTTPS端口
+        port = 443
         result = sock.connect_ex((host, port))
         sock.close()
         return result == 0
@@ -40,34 +39,30 @@ def check_network_available(host, timeout=2):
 
 
 def wait_for_network(config):
-    """等待网络连接"""
-    # 获取配置，默认启用，超时5秒
     wait_enabled = config.get("network_wait", {}).get("enabled", True)
     wait_timeout = config.get("network_wait", {}).get("timeout", 5)
-    
+
     if not wait_enabled:
         print("网络等待功能已禁用，直接开始...")
         return True
-    
+
     print(f"正在检测网络连接... (超时: {wait_timeout}秒)")
-    
+
     start_time = time.time()
-    
+
     while True:
         elapsed = time.time() - start_time
         if elapsed > wait_timeout:
             break
-        
-        # 尝试连接任意一个目标网站即可
+
         for target in PING_TARGETS:
             if check_network_available(target):
                 print(f"网络连接成功！(连接到 {target})")
                 return True
-        
+
         print(f"等待网络中... ({int(elapsed)}秒/{wait_timeout}秒)")
         time.sleep(1)
-    
-    # 超时后询问用户是否重试
+
     print("网络连接超时！")
     while True:
         choice = input("是否重试? (y/n, 默认: y): ").strip().lower() or "y"
@@ -113,12 +108,21 @@ def load_config() -> dict | None:
         return None
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
-    # 确保network_wait配置存在（向后兼容）
+    changed = False
     if "network_wait" not in config:
-        config["network_wait"] = {
-            "enabled": True,
-            "timeout": 5
+        config["network_wait"] = {"enabled": True, "timeout": 5}
+        changed = True
+    if "download_html" in config and "deepseek_summary" not in config:
+        config["deepseek_summary"] = {
+            "enabled": config["download_html"],
+            "api_key": ""
         }
+        del config["download_html"]
+        changed = True
+    elif "deepseek_summary" not in config:
+        config["deepseek_summary"] = {"enabled": False, "api_key": ""}
+        changed = True
+    if changed:
         save_config(config)
     return config
 
@@ -197,8 +201,21 @@ def interactive_setup() -> dict:
             except ValueError:
                 wait_timeout = 5
 
-    print("\n--- 附加功能 ---")
-    enable_download = input("是否启用新数据HTML页面下载? (y/n, 默认: n): ").strip().lower() == "y"
+    print("\n--- DeepSeek智能摘要 ---")
+    enable_deepseek = input("是否启用DeepSeek智能摘要? (y/n, 默认: n): ").strip().lower() == "y"
+    deepseek_api_key = ""
+    if enable_deepseek:
+        print("请输入DeepSeek API Key (可在 https://platform.deepseek.com 获取):")
+        deepseek_api_key = input("API Key: ").strip()
+        if deepseek_api_key:
+            print("正在测试API Key...")
+            success, msg = test_api_key(deepseek_api_key)
+            print(msg)
+            if not success:
+                print("API Key测试未通过，仍会保存配置，但摘要功能可能无法正常使用。")
+        else:
+            print("未输入API Key，摘要功能将无法使用。")
+            enable_deepseek = False
 
     config = {
         "email": {
@@ -215,7 +232,10 @@ def interactive_setup() -> dict:
         },
         "autostart": enable_autostart,
         "autostart_mode": autostart_mode,
-        "download_html": enable_download,
+        "deepseek_summary": {
+            "enabled": enable_deepseek,
+            "api_key": deepseek_api_key
+        },
         "network_wait": {
             "enabled": enable_network_wait,
             "timeout": wait_timeout
@@ -227,35 +247,6 @@ def interactive_setup() -> dict:
     return config
 
 
-def download_new_pages(new_items: list[tuple[str, str]], site_key: str):
-    if not new_items:
-        return
-
-    ensure_app_data_dir()
-    site_dir = os.path.join(HTML_SAVE_DIR, site_key)
-    os.makedirs(site_dir, exist_ok=True)
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-
-    for title, url in new_items:
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            resp.encoding = resp.apparent_encoding
-
-            safe_title = re.sub(r'[\\/:*?"<>|]', "_", title[:80])
-            filename = f"{safe_title}.html"
-            filepath = os.path.join(site_dir, filename)
-
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(resp.text)
-
-            print(f"  已下载: {filename}")
-        except Exception as e:
-            print(f"  下载失败 [{title[:30]}]: {e}")
-
-
 def run_crawl_and_notify():
     config = load_config()
     if not config:
@@ -265,7 +256,9 @@ def run_crawl_and_notify():
 
     db = DatabaseManager()
     email = EmailSender(config["email"])
-    download_enabled = config.get("download_html", False)
+    deepseek_config = config.get("deepseek_summary", {})
+    deepseek_enabled = deepseek_config.get("enabled", False)
+    deepseek_api_key = deepseek_config.get("api_key", "")
 
     all_results = []
 
@@ -327,6 +320,15 @@ def run_crawl_and_notify():
             )
         else:
             db.insert_records(site_key, new_items)
+
+            summaries = {}
+            if deepseek_enabled and deepseek_api_key:
+                summary_results = process_new_items(
+                    new_items, site_key, site_name, deepseek_api_key
+                )
+                for title, url, summary in summary_results:
+                    summaries[url] = summary
+
             all_results.append(
                 {
                     "site_name": site_name,
@@ -334,12 +336,9 @@ def run_crawl_and_notify():
                     "status": "update",
                     "message": f"发现 {len(new_items)} 条新通知",
                     "new_items": new_items,
+                    "summaries": summaries,
                 }
             )
-
-            if download_enabled:
-                print(f"\n[{site_name}] 下载新数据页面...")
-                download_new_pages(new_items, site_key)
 
     subject, body = compose_email(all_results)
 
@@ -369,10 +368,14 @@ def compose_email(results: list[dict]) -> tuple[str, str]:
         elif status == "update":
             new_count = len(result["new_items"])
             total_new += new_count
-            items_text = "\n".join(
-                f"  {i}. {t}\n     {u}"
-                for i, (t, u) in enumerate(result["new_items"], 1)
-            )
+            summaries = result.get("summaries", {})
+            items_lines = []
+            for i, (t, u) in enumerate(result["new_items"], 1):
+                items_lines.append(f"  {i}. {t}")
+                items_lines.append(f"     {u}")
+                if u in summaries and summaries[u]:
+                    items_lines.append(f"     摘要：{summaries[u]}")
+            items_text = "\n".join(items_lines)
             body_parts.append(f"【{site_name}】\n{items_text}\n")
         elif status == "not_initialized":
             has_error = True
@@ -542,7 +545,9 @@ def test_compare_and_push():
 
     db = DatabaseManager()
     email = EmailSender(config["email"])
-    download_enabled = config.get("download_html", False)
+    deepseek_config = config.get("deepseek_summary", {})
+    deepseek_enabled = deepseek_config.get("enabled", False)
+    deepseek_api_key = deepseek_config.get("api_key", "")
 
     print("=" * 50)
     print("       测试比对与推送功能")
@@ -605,6 +610,15 @@ def test_compare_and_push():
         if deleted_url in [u for t, u in new_items]:
             print(f"\n[测试通过] 删除的记录被正确识别为新记录!")
             db.insert_records(site_key, new_items)
+
+            summaries = {}
+            if deepseek_enabled and deepseek_api_key:
+                summary_results = process_new_items(
+                    new_items, site_key, site_name, deepseek_api_key
+                )
+                for title, url, summary in summary_results:
+                    summaries[url] = summary
+
             all_results.append(
                 {
                     "site_name": site_name,
@@ -612,12 +626,9 @@ def test_compare_and_push():
                     "status": "update",
                     "message": f"测试成功: 发现 {len(new_items)} 条新通知（含被删除的记录）",
                     "new_items": new_items,
+                    "summaries": summaries,
                 }
             )
-
-            if download_enabled:
-                print(f"\n[{site_name}] 下载新数据页面...")
-                download_new_pages(new_items, site_key)
         else:
             print(f"\n[测试异常] 删除的记录未被识别为新记录")
             db.insert_records(site_key, [deleted_record])
@@ -650,6 +661,56 @@ def test_compare_and_push():
         print(f"\n邮件发送失败: {e}")
 
 
+def config_deepseek():
+    config = load_config()
+    if not config:
+        print("未找到配置文件，请先运行: python crawler.py init")
+        return
+
+    deepseek_config = config.get("deepseek_summary", {})
+    current_enabled = deepseek_config.get("enabled", False)
+    current_key = deepseek_config.get("api_key", "")
+
+    print("=" * 50)
+    print("       DeepSeek智能摘要配置")
+    print("=" * 50)
+    print(f"当前状态: {'已启用' if current_enabled else '已禁用'}")
+    if current_key:
+        print(f"当前API Key: {current_key[:8]}...{current_key[-4:]}")
+
+    enable = input("\n是否启用DeepSeek智能摘要? (y/n, 默认: n): ").strip().lower() == "y"
+    api_key = ""
+    if enable:
+        if current_key:
+            change_key = input("是否更换API Key? (y/n, 默认: n): ").strip().lower() == "y"
+            if change_key:
+                print("请输入新的DeepSeek API Key:")
+                api_key = input("API Key: ").strip()
+            else:
+                api_key = current_key
+        else:
+            print("请输入DeepSeek API Key (可在 https://platform.deepseek.com 获取):")
+            api_key = input("API Key: ").strip()
+
+        if api_key:
+            print("正在测试API Key...")
+            success, msg = test_api_key(api_key)
+            print(msg)
+            if not success:
+                print("API Key测试未通过，仍会保存配置，但摘要功能可能无法正常使用。")
+        else:
+            print("未输入API Key，摘要功能将无法使用。")
+            enable = False
+
+    config["deepseek_summary"] = {
+        "enabled": enable,
+        "api_key": api_key if api_key else current_key
+    }
+    save_config(config)
+    print(f"\nDeepSeek智能摘要已{'启用' if enable else '禁用'}")
+    print(f"配置已保存到 {CONFIG_PATH}")
+
+
 def show_config():
     config = load_config()
     if not config:
@@ -659,6 +720,10 @@ def show_config():
     display = json.loads(json.dumps(config))
     if "email" in display and "password" in display["email"]:
         display["email"]["password"] = "******"
+    if "deepseek_summary" in display and "api_key" in display["deepseek_summary"]:
+        key = display["deepseek_summary"]["api_key"]
+        if key:
+            display["deepseek_summary"]["api_key"] = f"{key[:8]}...{key[-4:]}"
 
     print(json.dumps(display, ensure_ascii=False, indent=4))
     print(f"\n数据目录: {APP_DATA_DIR}")
@@ -677,6 +742,7 @@ def show_main_menu():
         ("立即执行爬取并邮件通知", has_config),
         ("启动定时调度器", has_config),
         ("测试比对与推送功能", has_config),
+        ("DeepSeek智能摘要配置", has_config),
         ("开启开机自启动", has_config),
         ("关闭开机自启动", True),
         ("查看当前配置", has_config),
@@ -736,6 +802,11 @@ def interactive_menu():
             input("\n按回车键继续...")
         elif num == 5:
             print("\n" + "-" * 40)
+            config_deepseek()
+            print("-" * 40)
+            input("\n按回车键继续...")
+        elif num == 6:
+            print("\n" + "-" * 40)
             print("请选择自启动模式:")
             print("  1. 控制台模式 (显示命令行窗口，直接运行爬虫)")
             print("  2. 静默模式 (不显示窗口，运行定时调度)")
@@ -750,17 +821,17 @@ def interactive_menu():
             setup_autostart(True, mode)
             print("-" * 40)
             input("\n按回车键继续...")
-        elif num == 6:
+        elif num == 7:
             print("\n" + "-" * 40)
             setup_autostart(False)
             print("-" * 40)
             input("\n按回车键继续...")
-        elif num == 7:
+        elif num == 8:
             print("\n" + "-" * 40)
             show_config()
             print("-" * 40)
             input("\n按回车键继续...")
-        elif num == 8:
+        elif num == 9:
             print("\n再见！")
             break
 
@@ -771,17 +842,12 @@ def main():
     config = load_config()
 
     if "--autostart-run" in sys.argv:
-        # 自启动运行：
-        # 控制台模式 -> 直接运行一次爬虫
-        # 静默模式 -> 启动定时调度器
         if config and config.get("autostart_mode") != "silent":
-            # 控制台模式或未知模式：直接运行一次爬虫
             print("开机自启动：直接执行爬取...")
             wait_for_network(config)
             run_crawl_and_notify()
             input("\n按回车键关闭程序...")
         else:
-            # 静默模式：启动定时调度器
             print("开机自启动：启动定时调度器...")
             wait_for_network(config)
             start_scheduler()
@@ -805,6 +871,7 @@ def main():
         autostart_parser.add_argument("action", choices=["on", "off"], help="on=开启, off=关闭")
 
         subparsers.add_parser("config", help="查看当前配置")
+        subparsers.add_parser("deepseek", help="配置DeepSeek智能摘要")
 
         args = parser.parse_args()
 
@@ -818,6 +885,8 @@ def main():
             setup_autostart(args.action == "on")
         elif args.command == "config":
             show_config()
+        elif args.command == "deepseek":
+            config_deepseek()
     else:
         interactive_menu()
 
