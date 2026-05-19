@@ -2,30 +2,129 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
+import socket
 
 import requests
 import schedule
 
-from db_manager import DatabaseManager
+from db_manager import DatabaseManager, APP_DATA_DIR, ensure_app_data_dir, migrate_from_script_dir
 from email_sender import EmailSender
 from site_crawlers import ALL_CRAWLERS
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+CONFIG_PATH = os.path.join(APP_DATA_DIR, "config.json")
 AUTOSTART_BAT_NAME = "crawl_monitor.bat"
-HTML_SAVE_DIR = os.path.join(SCRIPT_DIR, "downloaded_pages")
+HTML_SAVE_DIR = os.path.join(APP_DATA_DIR, "downloaded_pages")
+
+OLD_CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+OLD_HTML_SAVE_DIR = os.path.join(SCRIPT_DIR, "downloaded_pages")
+
+# 网络检测的目标网站
+PING_TARGETS = ["www.mee.gov.cn", "www.nhc.gov.cn"]
+
+
+def check_network_available(host, timeout=2):
+    """检测目标主机是否可连接"""
+    try:
+        socket.setdefaulttimeout(timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        port = 443  # HTTPS端口
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def wait_for_network(config):
+    """等待网络连接"""
+    # 获取配置，默认启用，超时5秒
+    wait_enabled = config.get("network_wait", {}).get("enabled", True)
+    wait_timeout = config.get("network_wait", {}).get("timeout", 5)
+    
+    if not wait_enabled:
+        print("网络等待功能已禁用，直接开始...")
+        return True
+    
+    print(f"正在检测网络连接... (超时: {wait_timeout}秒)")
+    
+    start_time = time.time()
+    
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > wait_timeout:
+            break
+        
+        # 尝试连接任意一个目标网站即可
+        for target in PING_TARGETS:
+            if check_network_available(target):
+                print(f"网络连接成功！(连接到 {target})")
+                return True
+        
+        print(f"等待网络中... ({int(elapsed)}秒/{wait_timeout}秒)")
+        time.sleep(1)
+    
+    # 超时后询问用户是否重试
+    print("网络连接超时！")
+    while True:
+        choice = input("是否重试? (y/n, 默认: y): ").strip().lower() or "y"
+        if choice == "y":
+            print("重新开始等待网络...")
+            return wait_for_network({
+                "network_wait": {
+                    "enabled": True,
+                    "timeout": wait_timeout
+                }
+            })
+        elif choice == "n":
+            print("继续尝试爬取...")
+            return False
+
+
+def migrate_legacy_data():
+    migrated = []
+
+    if os.path.exists(OLD_CONFIG_PATH) and not os.path.exists(CONFIG_PATH):
+        ensure_app_data_dir()
+        shutil.copy2(OLD_CONFIG_PATH, CONFIG_PATH)
+        migrated.append("config.json")
+
+    db_migrated = migrate_from_script_dir()
+    if db_migrated:
+        migrated.append("crawl_data.db")
+
+    if os.path.exists(OLD_HTML_SAVE_DIR) and not os.path.exists(HTML_SAVE_DIR):
+        ensure_app_data_dir()
+        shutil.copytree(OLD_HTML_SAVE_DIR, HTML_SAVE_DIR)
+        migrated.append("downloaded_pages/")
+
+    if migrated:
+        print(f"已将旧数据迁移至 {APP_DATA_DIR}:")
+        for item in migrated:
+            print(f"  - {item}")
+        print()
 
 
 def load_config() -> dict | None:
     if not os.path.exists(CONFIG_PATH):
         return None
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+    # 确保network_wait配置存在（向后兼容）
+    if "network_wait" not in config:
+        config["network_wait"] = {
+            "enabled": True,
+            "timeout": 5
+        }
+        save_config(config)
+    return config
 
 
 def save_config(config: dict):
+    ensure_app_data_dir()
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
 
@@ -74,8 +173,8 @@ def interactive_setup() -> dict:
     autostart_mode = "console"
     if enable_autostart:
         print("自启动模式:")
-        print("  1. 控制台模式 (显示命令行窗口)")
-        print("  2. 静默模式 (不显示窗口)")
+        print("  1. 控制台模式 (显示命令行窗口，直接运行爬虫)")
+        print("  2. 静默模式 (不显示窗口，运行定时调度)")
         print("  3. 运行后确认关闭 (执行一次爬取，显示结果后按回车关闭)")
         mode_choice = input("请选择 (1/2/3, 默认: 1): ").strip()
         if mode_choice == "2":
@@ -84,6 +183,19 @@ def interactive_setup() -> dict:
             autostart_mode = "run_once"
         else:
             autostart_mode = "console"
+
+    print("\n--- 网络等待配置 ---")
+    enable_network_wait = input("是否启用开机自启动时等待网络? (y/n, 默认: y): ").strip().lower() != "n"
+    wait_timeout = 5
+    if enable_network_wait:
+        wait_input = input("网络等待超时时间(秒) (默认: 5): ").strip()
+        if wait_input:
+            try:
+                wait_timeout = int(wait_input)
+                if wait_timeout < 1:
+                    wait_timeout = 5
+            except ValueError:
+                wait_timeout = 5
 
     print("\n--- 附加功能 ---")
     enable_download = input("是否启用新数据HTML页面下载? (y/n, 默认: n): ").strip().lower() == "y"
@@ -104,10 +216,14 @@ def interactive_setup() -> dict:
         "autostart": enable_autostart,
         "autostart_mode": autostart_mode,
         "download_html": enable_download,
+        "network_wait": {
+            "enabled": enable_network_wait,
+            "timeout": wait_timeout
+        }
     }
 
     save_config(config)
-    print("\n配置已保存到 config.json")
+    print(f"\n配置已保存到 {CONFIG_PATH}")
     return config
 
 
@@ -115,6 +231,7 @@ def download_new_pages(new_items: list[tuple[str, str]], site_key: str):
     if not new_items:
         return
 
+    ensure_app_data_dir()
     site_dir = os.path.join(HTML_SAVE_DIR, site_key)
     os.makedirs(site_dir, exist_ok=True)
 
@@ -142,7 +259,8 @@ def download_new_pages(new_items: list[tuple[str, str]], site_key: str):
 def run_crawl_and_notify():
     config = load_config()
     if not config:
-        print("错误: 未找到配置文件，请先运行: python crawler.py init")
+        print(f"错误: 未找到配置文件，请先运行: python crawler.py init")
+        print(f"配置文件路径: {CONFIG_PATH}")
         return
 
     db = DatabaseManager()
@@ -386,13 +504,14 @@ def setup_autostart(enable: bool, mode: str | None = None):
 def start_scheduler():
     config = load_config()
     if not config:
-        print("错误: 未找到配置文件，请先运行: python crawler.py init")
+        print(f"错误: 未找到配置文件，请先运行: python crawler.py init")
+        print(f"配置文件路径: {CONFIG_PATH}")
         return
 
     schedule_config = config.get("schedule", {})
     if not schedule_config.get("enabled"):
         print("定时执行未启用。")
-        print("请运行 'python crawler.py init' 配置定时执行，或手动编辑 config.json")
+        print(f"请运行 'python crawler.py init' 配置定时执行，或手动编辑 {CONFIG_PATH}")
         return
 
     schedule_time = schedule_config.get("time", "09:00")
@@ -542,6 +661,7 @@ def show_config():
         display["email"]["password"] = "******"
 
     print(json.dumps(display, ensure_ascii=False, indent=4))
+    print(f"\n数据目录: {APP_DATA_DIR}")
 
 
 def show_main_menu():
@@ -617,8 +737,8 @@ def interactive_menu():
         elif num == 5:
             print("\n" + "-" * 40)
             print("请选择自启动模式:")
-            print("  1. 控制台模式 (显示命令行窗口)")
-            print("  2. 静默模式 (不显示窗口)")
+            print("  1. 控制台模式 (显示命令行窗口，直接运行爬虫)")
+            print("  2. 静默模式 (不显示窗口，运行定时调度)")
             print("  3. 运行后确认关闭 (执行一次爬取，显示结果后按回车关闭)")
             mode_choice = input("请选择 (1/2/3, 默认: 1): ").strip()
             if mode_choice == "2":
@@ -646,11 +766,29 @@ def interactive_menu():
 
 
 def main():
+    migrate_legacy_data()
+
+    config = load_config()
+
     if "--autostart-run" in sys.argv:
-        start_scheduler()
+        # 自启动运行：
+        # 控制台模式 -> 直接运行一次爬虫
+        # 静默模式 -> 启动定时调度器
+        if config and config.get("autostart_mode") != "silent":
+            # 控制台模式或未知模式：直接运行一次爬虫
+            print("开机自启动：直接执行爬取...")
+            wait_for_network(config)
+            run_crawl_and_notify()
+            input("\n按回车键关闭程序...")
+        else:
+            # 静默模式：启动定时调度器
+            print("开机自启动：启动定时调度器...")
+            wait_for_network(config)
+            start_scheduler()
         return
 
     if "--autostart-run-once" in sys.argv:
+        wait_for_network(config)
         run_crawl_and_notify()
         input("\n按回车键关闭程序...")
         return

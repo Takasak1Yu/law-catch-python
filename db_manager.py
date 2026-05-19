@@ -1,11 +1,32 @@
 import sqlite3
 import os
+import shutil
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crawl_data.db")
+APP_NAME = "LawCatchCrawler"
+APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", ""), APP_NAME)
+DB_PATH = os.path.join(APP_DATA_DIR, "crawl_data.db")
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OLD_DB_PATH = os.path.join(SCRIPT_DIR, "crawl_data.db")
+
+
+def ensure_app_data_dir():
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+
+
+def migrate_from_script_dir():
+    if not os.path.exists(OLD_DB_PATH):
+        return False
+    if os.path.exists(DB_PATH):
+        return False
+    ensure_app_data_dir()
+    shutil.copy2(OLD_DB_PATH, DB_PATH)
+    return True
 
 
 class DatabaseManager:
     def __init__(self, db_path=DB_PATH):
+        ensure_app_data_dir()
         self.db_path = db_path
         self._init_db()
 
