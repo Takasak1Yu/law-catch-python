@@ -11,7 +11,10 @@ import requests
 import schedule
 
 from db_manager import DatabaseManager, APP_DATA_DIR, ensure_app_data_dir, migrate_from_script_dir
-from deepseek_summarizer import process_new_items, test_api_key
+from ai_summarizer import (
+    process_new_items, test_api_key, PROVIDERS,
+    DEFAULT_SUMMARY_PROMPT, KEYWORD_FILTER_PROMPT, BLOCKLIST_FILTER_PROMPT,
+)
 from email_sender import EmailSender
 from site_crawlers import ALL_CRAWLERS
 
@@ -103,6 +106,57 @@ def migrate_legacy_data():
         print()
 
 
+def _migrate_ai_config(config: dict) -> bool:
+    changed = False
+
+    if "download_html" in config and "ai_summary" not in config and "deepseek_summary" not in config:
+        config["ai_summary"] = {
+            "enabled": config["download_html"],
+            "provider": "deepseek",
+            "api_key": "",
+            "model": "",
+        }
+        del config["download_html"]
+        changed = True
+
+    if "deepseek_summary" in config and "ai_summary" not in config:
+        old = config["deepseek_summary"]
+        config["ai_summary"] = {
+            "enabled": old.get("enabled", False),
+            "provider": "deepseek",
+            "api_key": old.get("api_key", ""),
+            "model": "",
+        }
+        del config["deepseek_summary"]
+        changed = True
+
+    if "ai_summary" in config:
+        ai = config["ai_summary"]
+        if "keyword_filter" not in ai:
+            ai["keyword_filter"] = {"enabled": False, "keywords": [], "custom_prompt": ""}
+            changed = True
+        if "blocklist_filter" not in ai:
+            ai["blocklist_filter"] = {"enabled": False, "blockwords": [], "custom_prompt": ""}
+            changed = True
+        if "summary_prompt" not in ai:
+            ai["summary_prompt"] = ""
+            changed = True
+
+    if "ai_summary" not in config:
+        config["ai_summary"] = {
+            "enabled": False,
+            "provider": "deepseek",
+            "api_key": "",
+            "model": "",
+            "keyword_filter": {"enabled": False, "keywords": [], "custom_prompt": ""},
+            "blocklist_filter": {"enabled": False, "blockwords": [], "custom_prompt": ""},
+            "summary_prompt": "",
+        }
+        changed = True
+
+    return changed
+
+
 def load_config() -> dict | None:
     if not os.path.exists(CONFIG_PATH):
         return None
@@ -112,15 +166,7 @@ def load_config() -> dict | None:
     if "network_wait" not in config:
         config["network_wait"] = {"enabled": True, "timeout": 5}
         changed = True
-    if "download_html" in config and "deepseek_summary" not in config:
-        config["deepseek_summary"] = {
-            "enabled": config["download_html"],
-            "api_key": ""
-        }
-        del config["download_html"]
-        changed = True
-    elif "deepseek_summary" not in config:
-        config["deepseek_summary"] = {"enabled": False, "api_key": ""}
+    if _migrate_ai_config(config):
         changed = True
     if changed:
         save_config(config)
@@ -131,6 +177,32 @@ def save_config(config: dict):
     ensure_app_data_dir()
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
+
+
+def _apply_ai_to_new_items(new_items, site_key, site_name, ai_config):
+    ai_enabled = ai_config.get("enabled", False)
+    summaries = {}
+    filtered_items = []
+
+    if ai_enabled and ai_config.get("api_key"):
+        summary_results = process_new_items(
+            new_items, site_key, site_name, ai_config
+        )
+        for title, url, summary, is_filtered in summary_results:
+            if is_filtered:
+                filtered_items.append((title, url))
+            else:
+                summaries[url] = summary
+    else:
+        for title, url in new_items:
+            summaries[url] = None
+
+    email_items = [(t, u) for t, u in new_items if (t, u) not in filtered_items]
+
+    if filtered_items:
+        print(f"  [{site_name}] 已过滤 {len(filtered_items)} 条不相关通知")
+
+    return email_items, summaries
 
 
 def interactive_setup() -> dict:
@@ -201,21 +273,67 @@ def interactive_setup() -> dict:
             except ValueError:
                 wait_timeout = 5
 
-    print("\n--- DeepSeek智能摘要 ---")
-    enable_deepseek = input("是否启用DeepSeek智能摘要? (y/n, 默认: n): ").strip().lower() == "y"
-    deepseek_api_key = ""
-    if enable_deepseek:
-        print("请输入DeepSeek API Key (可在 https://platform.deepseek.com 获取):")
-        deepseek_api_key = input("API Key: ").strip()
-        if deepseek_api_key:
+    print("\n--- AI智能摘要 ---")
+    enable_ai = input("是否启用AI智能摘要? (y/n, 默认: n): ").strip().lower() == "y"
+    ai_provider = "deepseek"
+    ai_api_key = ""
+    ai_model = ""
+    keyword_filter = {"enabled": False, "keywords": [], "custom_prompt": ""}
+    blocklist_filter = {"enabled": False, "blockwords": [], "custom_prompt": ""}
+    summary_prompt = ""
+
+    if enable_ai:
+        print("\n请选择AI服务提供商:")
+        print("  1. DeepSeek")
+        print("  2. OpenAI (ChatGPT)")
+        provider_choice = input("请选择 (1/2, 默认: 1): ").strip()
+        if provider_choice == "2":
+            ai_provider = "openai"
+            print("请输入OpenAI API Key:")
+            ai_api_key = input("API Key: ").strip()
+            print("请输入模型名称 (默认: gpt-4o-mini, 可选: gpt-4o, gpt-4o-mini, gpt-3.5-turbo 等):")
+            ai_model = input("模型: ").strip() or "gpt-4o-mini"
+        else:
+            ai_provider = "deepseek"
+            print("请输入DeepSeek API Key (可在 https://platform.deepseek.com 获取):")
+            ai_api_key = input("API Key: ").strip()
+            print("请输入模型名称 (默认: deepseek-chat, 可选: deepseek-chat, deepseek-reasoner 等):")
+            ai_model = input("模型: ").strip() or "deepseek-chat"
+
+        if ai_api_key:
             print("正在测试API Key...")
-            success, msg = test_api_key(deepseek_api_key)
+            success, msg = test_api_key(ai_api_key, ai_provider, ai_model)
             print(msg)
             if not success:
                 print("API Key测试未通过，仍会保存配置，但摘要功能可能无法正常使用。")
         else:
             print("未输入API Key，摘要功能将无法使用。")
-            enable_deepseek = False
+            enable_ai = False
+
+    if enable_ai:
+        print("\n--- 关键词筛选 ---")
+        enable_keyword = input("是否启用关键词筛选? (y/n, 默认: n): ").strip().lower() == "y"
+        if enable_keyword:
+            print("请输入关注的关键词 (用逗号分隔，AI将判断通知是否与这些关键词相关):")
+            kw_input = input("关键词: ").strip()
+            keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
+            if not keywords:
+                print("未输入关键词，关键词筛选将不生效。")
+                enable_keyword = False
+            else:
+                keyword_filter = {"enabled": True, "keywords": keywords, "custom_prompt": ""}
+
+        print("\n--- 屏蔽词筛选 ---")
+        enable_blocklist = input("是否启用屏蔽词筛选? (y/n, 默认: n): ").strip().lower() == "y"
+        if enable_blocklist:
+            print("请输入屏蔽词 (用逗号分隔，AI将判断通知是否涉及这些屏蔽词主题):")
+            bw_input = input("屏蔽词: ").strip()
+            blockwords = [b.strip() for b in bw_input.split(",") if b.strip()]
+            if not blockwords:
+                print("未输入屏蔽词，屏蔽词筛选将不生效。")
+                enable_blocklist = False
+            else:
+                blocklist_filter = {"enabled": True, "blockwords": blockwords, "custom_prompt": ""}
 
     config = {
         "email": {
@@ -232,9 +350,14 @@ def interactive_setup() -> dict:
         },
         "autostart": enable_autostart,
         "autostart_mode": autostart_mode,
-        "deepseek_summary": {
-            "enabled": enable_deepseek,
-            "api_key": deepseek_api_key
+        "ai_summary": {
+            "enabled": enable_ai,
+            "provider": ai_provider,
+            "api_key": ai_api_key,
+            "model": ai_model,
+            "keyword_filter": keyword_filter,
+            "blocklist_filter": blocklist_filter,
+            "summary_prompt": summary_prompt,
         },
         "network_wait": {
             "enabled": enable_network_wait,
@@ -244,6 +367,7 @@ def interactive_setup() -> dict:
 
     save_config(config)
     print(f"\n配置已保存到 {CONFIG_PATH}")
+    print("提示: 可通过主菜单「AI智能摘要与筛选配置」进一步调整各项设置")
     return config
 
 
@@ -256,9 +380,7 @@ def run_crawl_and_notify():
 
     db = DatabaseManager()
     email = EmailSender(config["email"])
-    deepseek_config = config.get("deepseek_summary", {})
-    deepseek_enabled = deepseek_config.get("enabled", False)
-    deepseek_api_key = deepseek_config.get("api_key", "")
+    ai_config = config.get("ai_summary", {})
 
     all_results = []
 
@@ -321,21 +443,17 @@ def run_crawl_and_notify():
         else:
             db.insert_records(site_key, new_items)
 
-            summaries = {}
-            if deepseek_enabled and deepseek_api_key:
-                summary_results = process_new_items(
-                    new_items, site_key, site_name, deepseek_api_key
-                )
-                for title, url, summary in summary_results:
-                    summaries[url] = summary
+            email_items, summaries = _apply_ai_to_new_items(
+                new_items, site_key, site_name, ai_config
+            )
 
             all_results.append(
                 {
                     "site_name": site_name,
                     "site_key": site_key,
                     "status": "update",
-                    "message": f"发现 {len(new_items)} 条新通知",
-                    "new_items": new_items,
+                    "message": f"发现 {len(email_items)} 条新通知",
+                    "new_items": email_items,
                     "summaries": summaries,
                 }
             )
@@ -376,7 +494,9 @@ def compose_email(results: list[dict]) -> tuple[str, str]:
                 if u in summaries and summaries[u]:
                     items_lines.append(f"     摘要：{summaries[u]}")
             items_text = "\n".join(items_lines)
-            body_parts.append(f"【{site_name}】\n{items_text}\n")
+            msg = result.get("message", "")
+            header = f"【{site_name}】{msg}"
+            body_parts.append(f"{header}\n{items_text}\n")
         elif status == "not_initialized":
             has_error = True
             body_parts.append(f"【{site_name}】\n状态：未初始化\n{result['message']}\n")
@@ -545,9 +665,7 @@ def test_compare_and_push():
 
     db = DatabaseManager()
     email = EmailSender(config["email"])
-    deepseek_config = config.get("deepseek_summary", {})
-    deepseek_enabled = deepseek_config.get("enabled", False)
-    deepseek_api_key = deepseek_config.get("api_key", "")
+    ai_config = config.get("ai_summary", {})
 
     print("=" * 50)
     print("       测试比对与推送功能")
@@ -611,21 +729,17 @@ def test_compare_and_push():
             print(f"\n[测试通过] 删除的记录被正确识别为新记录!")
             db.insert_records(site_key, new_items)
 
-            summaries = {}
-            if deepseek_enabled and deepseek_api_key:
-                summary_results = process_new_items(
-                    new_items, site_key, site_name, deepseek_api_key
-                )
-                for title, url, summary in summary_results:
-                    summaries[url] = summary
+            email_items, summaries = _apply_ai_to_new_items(
+                new_items, site_key, site_name, ai_config
+            )
 
             all_results.append(
                 {
                     "site_name": site_name,
                     "site_key": site_key,
                     "status": "update",
-                    "message": f"测试成功: 发现 {len(new_items)} 条新通知（含被删除的记录）",
-                    "new_items": new_items,
+                    "message": f"发现 {len(email_items)} 条新通知",
+                    "new_items": email_items,
                     "summaries": summaries,
                 }
             )
@@ -661,54 +775,327 @@ def test_compare_and_push():
         print(f"\n邮件发送失败: {e}")
 
 
-def config_deepseek():
+def _show_ai_submenu(ai: dict):
+    enabled = ai.get("enabled", False)
+    provider = ai.get("provider", "deepseek")
+    model = ai.get("model", "")
+    api_key = ai.get("api_key", "")
+    kw = ai.get("keyword_filter", {})
+    bw = ai.get("blocklist_filter", {})
+
+    provider_name = "DeepSeek" if provider == "deepseek" else "OpenAI"
+
+    print("\n" + "=" * 50)
+    print("       AI智能摘要与筛选配置")
+    print("=" * 50)
+    print(f"  AI智能摘要: {'已启用' if enabled else '已禁用'}")
+    if enabled:
+        print(f"  提供商: {provider_name}")
+        print(f"  模型: {model or PROVIDERS[provider]['default_model']}")
+        if api_key:
+            print(f"  API Key: {api_key[:8]}...{api_key[-4:]}")
+        else:
+            print(f"  API Key: 未设置")
+    print(f"  关键词筛选: {'已启用' if kw.get('enabled') else '已禁用'}", end="")
+    if kw.get("keywords"):
+        print(f" ({', '.join(kw['keywords'])})")
+    else:
+        print()
+    print(f"  屏蔽词筛选: {'已启用' if bw.get('enabled') else '已禁用'}", end="")
+    if bw.get("blockwords"):
+        print(f" ({', '.join(bw['blockwords'])})")
+    else:
+        print()
+
+    print("\n请选择操作：")
+    print("  1. 启用/禁用AI智能摘要")
+    print("  2. 配置API提供商与密钥")
+    print("  3. 关键词筛选设置")
+    print("  4. 屏蔽词筛选设置")
+    print("  5. 提示词查看与编辑")
+    print("  6. 返回主菜单")
+
+
+def _ai_toggle_enable(config: dict):
+    ai = config["ai_summary"]
+    current = ai.get("enabled", False)
+    new_state = not current
+    ai["enabled"] = new_state
+    save_config(config)
+    print(f"\nAI智能摘要已{'启用' if new_state else '禁用'}")
+
+
+def _ai_config_api(config: dict):
+    ai = config["ai_summary"]
+    current_provider = ai.get("provider", "deepseek")
+    current_key = ai.get("api_key", "")
+    current_model = ai.get("model", "")
+
+    print("\n请选择AI服务提供商:")
+    print("  1. DeepSeek")
+    print("  2. OpenAI (ChatGPT)")
+    provider_choice = input(f"请选择 (1/2, 默认: {'1' if current_provider == 'deepseek' else '2'}): ").strip()
+    if provider_choice == "2":
+        provider = "openai"
+    else:
+        provider = "deepseek"
+
+    default_model = PROVIDERS[provider]["default_model"]
+    provider_name = "DeepSeek" if provider == "deepseek" else "OpenAI"
+
+    if current_key and provider == current_provider:
+        print(f"当前API Key: {current_key[:8]}...{current_key[-4:]}")
+        change_key = input("是否更换API Key? (y/n, 默认: n): ").strip().lower() == "y"
+        if change_key:
+            print(f"请输入{provider_name} API Key:")
+            api_key = input("API Key: ").strip()
+        else:
+            api_key = current_key
+    else:
+        print(f"请输入{provider_name} API Key:")
+        api_key = input("API Key: ").strip()
+
+    print(f"请输入模型名称 (默认: {default_model}):")
+    model = input("模型: ").strip() or default_model
+
+    if api_key:
+        print("正在测试API Key...")
+        success, msg = test_api_key(api_key, provider, model)
+        print(msg)
+        if not success:
+            print("API Key测试未通过，仍会保存配置，但摘要功能可能无法正常使用。")
+
+    ai = config["ai_summary"]
+    ai["provider"] = provider
+    ai["api_key"] = api_key if api_key else (current_key if provider == current_provider else "")
+    ai["model"] = model
+    save_config(config)
+    print(f"\nAPI配置已保存")
+
+
+def _ai_config_keyword(config: dict):
+    ai = config["ai_summary"]
+    kw = ai.get("keyword_filter", {})
+    current_enabled = kw.get("enabled", False)
+    current_keywords = kw.get("keywords", [])
+
+    if current_enabled:
+        print(f"\n关键词筛选当前: 已启用")
+        print(f"关键词: {', '.join(current_keywords) if current_keywords else '无'}")
+        action = input("选择操作: 1=关闭 2=修改关键词 (默认: 1): ").strip()
+        if action == "2":
+            print("请输入新的关键词 (用逗号分隔，AI将判断通知是否与这些关键词相关):")
+            kw_input = input("关键词: ").strip()
+            keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
+            if keywords:
+                ai["keyword_filter"] = {"enabled": True, "keywords": keywords, "custom_prompt": kw.get("custom_prompt", "")}
+                save_config(config)
+                print(f"关键词已更新: {', '.join(keywords)}")
+            else:
+                print("未输入关键词，关键词筛选已关闭。")
+                ai["keyword_filter"] = {"enabled": False, "keywords": [], "custom_prompt": kw.get("custom_prompt", "")}
+                save_config(config)
+        else:
+            ai["keyword_filter"]["enabled"] = False
+            save_config(config)
+            print("关键词筛选已关闭")
+    else:
+        print(f"\n关键词筛选当前: 已禁用")
+        action = input("是否启用关键词筛选? (y/n, 默认: n): ").strip().lower() == "y"
+        if action:
+            print("请输入关注的关键词 (用逗号分隔，AI将判断通知是否与这些关键词相关):")
+            kw_input = input("关键词: ").strip()
+            keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
+            if keywords:
+                ai["keyword_filter"] = {"enabled": True, "keywords": keywords, "custom_prompt": kw.get("custom_prompt", "")}
+                save_config(config)
+                print(f"关键词筛选已启用，关键词: {', '.join(keywords)}")
+            else:
+                print("未输入关键词，关键词筛选未启用。")
+
+
+def _ai_config_blocklist(config: dict):
+    ai = config["ai_summary"]
+    bw = ai.get("blocklist_filter", {})
+    current_enabled = bw.get("enabled", False)
+    current_blockwords = bw.get("blockwords", [])
+
+    if current_enabled:
+        print(f"\n屏蔽词筛选当前: 已启用")
+        print(f"屏蔽词: {', '.join(current_blockwords) if current_blockwords else '无'}")
+        action = input("选择操作: 1=关闭 2=修改屏蔽词 (默认: 1): ").strip()
+        if action == "2":
+            print("请输入新的屏蔽词 (用逗号分隔，AI将判断通知是否涉及这些屏蔽词主题):")
+            bw_input = input("屏蔽词: ").strip()
+            blockwords = [b.strip() for b in bw_input.split(",") if b.strip()]
+            if blockwords:
+                ai["blocklist_filter"] = {"enabled": True, "blockwords": blockwords, "custom_prompt": bw.get("custom_prompt", "")}
+                save_config(config)
+                print(f"屏蔽词已更新: {', '.join(blockwords)}")
+            else:
+                print("未输入屏蔽词，屏蔽词筛选已关闭。")
+                ai["blocklist_filter"] = {"enabled": False, "blockwords": [], "custom_prompt": bw.get("custom_prompt", "")}
+                save_config(config)
+        else:
+            ai["blocklist_filter"]["enabled"] = False
+            save_config(config)
+            print("屏蔽词筛选已关闭")
+    else:
+        print(f"\n屏蔽词筛选当前: 已禁用")
+        action = input("是否启用屏蔽词筛选? (y/n, 默认: n): ").strip().lower() == "y"
+        if action:
+            print("请输入屏蔽词 (用逗号分隔，AI将判断通知是否涉及这些屏蔽词主题):")
+            bw_input = input("屏蔽词: ").strip()
+            blockwords = [b.strip() for b in bw_input.split(",") if b.strip()]
+            if blockwords:
+                ai["blocklist_filter"] = {"enabled": True, "blockwords": blockwords, "custom_prompt": bw.get("custom_prompt", "")}
+                save_config(config)
+                print(f"屏蔽词筛选已启用，屏蔽词: {', '.join(blockwords)}")
+            else:
+                print("未输入屏蔽词，屏蔽词筛选未启用。")
+
+
+def _ai_edit_prompts(config: dict):
+    ai = config["ai_summary"]
+
+    while True:
+        kw_prompt = ai.get("keyword_filter", {}).get("custom_prompt", "")
+        bw_prompt = ai.get("blocklist_filter", {}).get("custom_prompt", "")
+        summary_prompt = ai.get("summary_prompt", "")
+
+        print("\n" + "-" * 40)
+        print("  提示词查看与编辑")
+        print("-" * 40)
+        print(f"  1. 关键词筛选提示词 [{'自定义' if kw_prompt else '默认'}]")
+        print(f"  2. 屏蔽词筛选提示词 [{'自定义' if bw_prompt else '默认'}]")
+        print(f"  3. 摘要提示词 [{'自定义' if summary_prompt else '默认'}]")
+        print(f"  4. 一键恢复所有提示词为默认")
+        print(f"  5. 返回上级菜单")
+
+        choice = input("\n请选择: ").strip()
+
+        if choice == "1":
+            current = kw_prompt if kw_prompt else KEYWORD_FILTER_PROMPT
+            print(f"\n--- 当前关键词筛选提示词 ---")
+            print(current)
+            print("---")
+            edit = input("\n是否编辑? (y/n, 默认: n): ").strip().lower() == "y"
+            if edit:
+                print("请输入新的关键词筛选提示词 (输入空行结束，直接回车留空则清除自定义恢复默认):")
+                lines = []
+                while True:
+                    line = input()
+                    if line == "" and not lines:
+                        lines = [""]
+                        break
+                    if line == "":
+                        break
+                    lines.append(line)
+                new_prompt = "\n".join(lines) if lines else ""
+                if new_prompt == "":
+                    ai["keyword_filter"]["custom_prompt"] = ""
+                    save_config(config)
+                    print("已恢复为默认关键词筛选提示词")
+                else:
+                    ai["keyword_filter"]["custom_prompt"] = new_prompt
+                    save_config(config)
+                    print("关键词筛选提示词已更新")
+
+        elif choice == "2":
+            current = bw_prompt if bw_prompt else BLOCKLIST_FILTER_PROMPT
+            print(f"\n--- 当前屏蔽词筛选提示词 ---")
+            print(current)
+            print("---")
+            edit = input("\n是否编辑? (y/n, 默认: n): ").strip().lower() == "y"
+            if edit:
+                print("请输入新的屏蔽词筛选提示词 (输入空行结束，直接回车留空则清除自定义恢复默认):")
+                lines = []
+                while True:
+                    line = input()
+                    if line == "" and not lines:
+                        lines = [""]
+                        break
+                    if line == "":
+                        break
+                    lines.append(line)
+                new_prompt = "\n".join(lines) if lines else ""
+                if new_prompt == "":
+                    ai["blocklist_filter"]["custom_prompt"] = ""
+                    save_config(config)
+                    print("已恢复为默认屏蔽词筛选提示词")
+                else:
+                    ai["blocklist_filter"]["custom_prompt"] = new_prompt
+                    save_config(config)
+                    print("屏蔽词筛选提示词已更新")
+
+        elif choice == "3":
+            current = summary_prompt if summary_prompt else DEFAULT_SUMMARY_PROMPT
+            print(f"\n--- 当前摘要提示词 ---")
+            print(current)
+            print("---")
+            edit = input("\n是否编辑? (y/n, 默认: n): ").strip().lower() == "y"
+            if edit:
+                print("请输入新的摘要提示词 (输入空行结束，直接回车留空则清除自定义恢复默认):")
+                lines = []
+                while True:
+                    line = input()
+                    if line == "" and not lines:
+                        lines = [""]
+                        break
+                    if line == "":
+                        break
+                    lines.append(line)
+                new_prompt = "\n".join(lines) if lines else ""
+                if new_prompt == "":
+                    ai["summary_prompt"] = ""
+                    save_config(config)
+                    print("已恢复为默认摘要提示词")
+                else:
+                    ai["summary_prompt"] = new_prompt
+                    save_config(config)
+                    print("摘要提示词已更新")
+
+        elif choice == "4":
+            confirm = input("确认恢复所有提示词为默认? (y/n, 默认: n): ").strip().lower() == "y"
+            if confirm:
+                ai["keyword_filter"]["custom_prompt"] = ""
+                ai["blocklist_filter"]["custom_prompt"] = ""
+                ai["summary_prompt"] = ""
+                save_config(config)
+                print("所有提示词已恢复为默认")
+            else:
+                print("已取消")
+
+        elif choice == "5":
+            break
+
+
+def config_ai():
     config = load_config()
     if not config:
         print("未找到配置文件，请先运行: python crawler.py init")
         return
 
-    deepseek_config = config.get("deepseek_summary", {})
-    current_enabled = deepseek_config.get("enabled", False)
-    current_key = deepseek_config.get("api_key", "")
+    while True:
+        ai = config.get("ai_summary", {})
+        _show_ai_submenu(ai)
 
-    print("=" * 50)
-    print("       DeepSeek智能摘要配置")
-    print("=" * 50)
-    print(f"当前状态: {'已启用' if current_enabled else '已禁用'}")
-    if current_key:
-        print(f"当前API Key: {current_key[:8]}...{current_key[-4:]}")
+        choice = input("\n请输入选项编号: ").strip()
 
-    enable = input("\n是否启用DeepSeek智能摘要? (y/n, 默认: n): ").strip().lower() == "y"
-    api_key = ""
-    if enable:
-        if current_key:
-            change_key = input("是否更换API Key? (y/n, 默认: n): ").strip().lower() == "y"
-            if change_key:
-                print("请输入新的DeepSeek API Key:")
-                api_key = input("API Key: ").strip()
-            else:
-                api_key = current_key
+        if choice == "1":
+            _ai_toggle_enable(config)
+        elif choice == "2":
+            _ai_config_api(config)
+        elif choice == "3":
+            _ai_config_keyword(config)
+        elif choice == "4":
+            _ai_config_blocklist(config)
+        elif choice == "5":
+            _ai_edit_prompts(config)
+        elif choice == "6":
+            break
         else:
-            print("请输入DeepSeek API Key (可在 https://platform.deepseek.com 获取):")
-            api_key = input("API Key: ").strip()
-
-        if api_key:
-            print("正在测试API Key...")
-            success, msg = test_api_key(api_key)
-            print(msg)
-            if not success:
-                print("API Key测试未通过，仍会保存配置，但摘要功能可能无法正常使用。")
-        else:
-            print("未输入API Key，摘要功能将无法使用。")
-            enable = False
-
-    config["deepseek_summary"] = {
-        "enabled": enable,
-        "api_key": api_key if api_key else current_key
-    }
-    save_config(config)
-    print(f"\nDeepSeek智能摘要已{'启用' if enable else '禁用'}")
-    print(f"配置已保存到 {CONFIG_PATH}")
+            print("无效选项，请重新输入")
 
 
 def show_config():
@@ -720,10 +1107,10 @@ def show_config():
     display = json.loads(json.dumps(config))
     if "email" in display and "password" in display["email"]:
         display["email"]["password"] = "******"
-    if "deepseek_summary" in display and "api_key" in display["deepseek_summary"]:
-        key = display["deepseek_summary"]["api_key"]
+    if "ai_summary" in display and "api_key" in display["ai_summary"]:
+        key = display["ai_summary"]["api_key"]
         if key:
-            display["deepseek_summary"]["api_key"] = f"{key[:8]}...{key[-4:]}"
+            display["ai_summary"]["api_key"] = f"{key[:8]}...{key[-4:]}"
 
     print(json.dumps(display, ensure_ascii=False, indent=4))
     print(f"\n数据目录: {APP_DATA_DIR}")
@@ -742,7 +1129,7 @@ def show_main_menu():
         ("立即执行爬取并邮件通知", has_config),
         ("启动定时调度器", has_config),
         ("测试比对与推送功能", has_config),
-        ("DeepSeek智能摘要配置", has_config),
+        ("AI智能摘要与筛选配置", has_config),
         ("开启开机自启动", has_config),
         ("关闭开机自启动", True),
         ("查看当前配置", has_config),
@@ -801,10 +1188,7 @@ def interactive_menu():
             print("-" * 40)
             input("\n按回车键继续...")
         elif num == 5:
-            print("\n" + "-" * 40)
-            config_deepseek()
-            print("-" * 40)
-            input("\n按回车键继续...")
+            config_ai()
         elif num == 6:
             print("\n" + "-" * 40)
             print("请选择自启动模式:")
@@ -871,7 +1255,7 @@ def main():
         autostart_parser.add_argument("action", choices=["on", "off"], help="on=开启, off=关闭")
 
         subparsers.add_parser("config", help="查看当前配置")
-        subparsers.add_parser("deepseek", help="配置DeepSeek智能摘要")
+        subparsers.add_parser("ai", help="配置AI智能摘要与筛选")
 
         args = parser.parse_args()
 
@@ -885,8 +1269,8 @@ def main():
             setup_autostart(args.action == "on")
         elif args.command == "config":
             show_config()
-        elif args.command == "deepseek":
-            config_deepseek()
+        elif args.command == "ai":
+            config_ai()
     else:
         interactive_menu()
 
