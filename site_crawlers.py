@@ -1,9 +1,12 @@
 import os
 import time
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from abc import ABC, abstractmethod
 from DrissionPage import ChromiumPage, ChromiumOptions
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class BaseCrawler(ABC):
@@ -26,7 +29,7 @@ class MeeGovCrawler(BaseCrawler):
     }
 
     def crawl(self) -> list[tuple[str, str]]:
-        resp = requests.get(self.IFRAME_URL, headers=self.HEADERS, timeout=15)
+        resp = requests.get(self.IFRAME_URL, headers=self.HEADERS, timeout=15, verify=False)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -53,7 +56,7 @@ class MeeGovGzkCrawler(BaseCrawler):
     }
 
     def crawl(self) -> list[tuple[str, str]]:
-        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15)
+        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15, verify=False)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -97,12 +100,13 @@ class NhcGovCrawler(BaseCrawler):
             raise RuntimeError("未找到Edge浏览器，无法爬取国家卫健委网站")
 
         co = ChromiumOptions()
-        co.set_browser_path(edge_path)
-        temp_dir = os.path.join(os.environ.get("TEMP", ""), "crawl_nhc_profile")
-        os.makedirs(temp_dir, exist_ok=True)
-        co.set_user_data_path(temp_dir)
+        co.set_paths(browser_path=edge_path, local_port=9223,
+                     user_data_path=os.path.join(os.environ.get("TEMP", ""), "crawl_nhc_profile"))
         co.set_argument("--no-sandbox")
         co.set_argument("--disable-blink-features=AutomationControlled")
+        co.set_argument("--ignore-certificate-errors")
+        co.set_argument("--proxy-server='direct://'")
+        co.set_argument("--proxy-bypass-list=*")
 
         page = ChromiumPage(co)
         try:
@@ -146,7 +150,7 @@ class MeeGovGtfwSubCrawler(BaseCrawler):
         from urllib.parse import urljoin
 
         url = self.BASE_URL + self.SUB_PATH
-        resp = requests.get(url, headers=self.HEADERS, timeout=15)
+        resp = requests.get(url, headers=self.HEADERS, timeout=15, verify=False)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -213,7 +217,7 @@ class NifdcCrawler(BaseCrawler):
     def crawl(self) -> list[tuple[str, str]]:
         from urllib.parse import urljoin
 
-        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15)
+        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15, verify=False)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -272,9 +276,13 @@ class NmpaCrawler(BaseCrawler):
             raise RuntimeError("未找到Edge浏览器，无法爬取国家药监局网站")
 
         co = ChromiumOptions()
-        co.set_paths(browser_path=edge_path, user_data_path=os.path.join(os.environ.get("TEMP", ""), "crawl_nmpa_profile"))
+        co.set_paths(browser_path=edge_path, local_port=9224,
+                     user_data_path=os.path.join(os.environ.get("TEMP", ""), "crawl_nmpa_profile"))
         co.set_argument("--no-sandbox")
         co.set_argument("--disable-blink-features=AutomationControlled")
+        co.set_argument("--ignore-certificate-errors")
+        co.set_argument("--proxy-server='direct://'")
+        co.set_argument("--proxy-bypass-list=*")
 
         page = ChromiumPage(co)
         try:
@@ -352,9 +360,13 @@ class CustomsGovCrawler(BaseCrawler):
             raise RuntimeError("未找到Edge浏览器，无法爬取海关总署网站")
 
         co = ChromiumOptions()
-        co.set_paths(browser_path=edge_path, user_data_path=os.path.join(os.environ.get("TEMP", ""), "crawl_customs_profile"))
+        co.set_paths(browser_path=edge_path, local_port=9225,
+                     user_data_path=os.path.join(os.environ.get("TEMP", ""), "crawl_customs_profile"))
         co.set_argument("--no-sandbox")
         co.set_argument("--disable-blink-features=AutomationControlled")
+        co.set_argument("--ignore-certificate-errors")
+        co.set_argument("--proxy-server='direct://'")
+        co.set_argument("--proxy-bypass-list=*")
 
         page = ChromiumPage(co)
         try:
@@ -407,7 +419,7 @@ class ShMsaCrawler(BaseCrawler):
     def crawl(self) -> list[tuple[str, str]]:
         from urllib.parse import urljoin
 
-        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15)
+        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15, verify=False)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -441,7 +453,7 @@ class MemGovCrawler(BaseCrawler):
     def crawl(self) -> list[tuple[str, str]]:
         from urllib.parse import urljoin
 
-        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15)
+        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15, verify=False)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 

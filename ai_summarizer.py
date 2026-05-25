@@ -2,20 +2,15 @@ import os
 import re
 import time
 import requests
+import urllib3
 
 from db_manager import APP_DATA_DIR, ensure_app_data_dir
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 HTML_SAVE_DIR = os.path.join(APP_DATA_DIR, "downloaded_pages")
 
-BROWSER_REQUIRED_DOMAINS = [
-    "customs.gov.cn",
-    "nmpa.gov.cn",
-]
-
-BROWSER_DOMAIN_ENTRY = {
-    "customs.gov.cn": "http://www.customs.gov.cn/customs/302249/302266/index.html",
-    "nmpa.gov.cn": "https://www.nmpa.gov.cn/hzhp/hzhpjmtg/index.html",
-}
+WAF_SITES = ["customs_gov", "nhc_gov", "nmpa_"]
 
 PROVIDERS = {
     "deepseek": {
@@ -81,7 +76,7 @@ def _call_api(api_url: str, api_key: str, model: str, messages: list[dict],
     }
 
     try:
-        resp = requests.post(api_url, headers=headers, json=payload, timeout=120)
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=120, verify=False)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
@@ -107,34 +102,6 @@ def _extract_text(html_content: str) -> str:
     return text
 
 
-def _needs_browser(url: str) -> bool:
-    for domain in BROWSER_REQUIRED_DOMAINS:
-        if domain in url:
-            return True
-    return False
-
-
-def _get_entry_url(url: str) -> str | None:
-    for domain, entry_url in BROWSER_DOMAIN_ENTRY.items():
-        if domain in url:
-            return entry_url
-    return None
-
-
-def _is_waf_challenge(html: str) -> bool:
-    if not html:
-        return True
-    if "$_ts" in html and "r='m'" in html:
-        return True
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-    body = soup.find("body")
-    if not body:
-        return True
-    text = body.get_text(strip=True)
-    return len(text) < 100
-
-
 def _get_edge_path() -> str | None:
     paths = [
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -146,71 +113,41 @@ def _get_edge_path() -> str | None:
     return None
 
 
-def _download_batch_with_browser(
-    items: list[tuple[str, str]], site_dir: str,
-) -> list[tuple[str, str, str]]:
+def _download_with_browser(urls: list[str]) -> list[str | None]:
     from DrissionPage import ChromiumPage, ChromiumOptions
 
     edge_path = _get_edge_path()
     if not edge_path:
-        for title, url in items:
-            print(f"  浏览器下载失败(未找到Edge) [{title[:30]}]")
-        return []
+        return [None] * len(urls)
 
     co = ChromiumOptions()
-    co.set_paths(
-        browser_path=edge_path,
-        user_data_path=os.path.join(
-            os.environ.get("TEMP", ""), "crawl_ai_download_profile"
-        ),
-    )
+    co.set_paths(browser_path=edge_path, local_port=9227,
+                 user_data_path=os.path.join(os.environ.get("TEMP", ""), "download_html_profile"))
     co.set_argument("--no-sandbox")
     co.set_argument("--disable-blink-features=AutomationControlled")
+    co.set_argument("--ignore-certificate-errors")
+    co.set_argument("--proxy-server='direct://'")
+    co.set_argument("--proxy-bypass-list=*")
 
     page = ChromiumPage(co)
-    downloaded = []
+    results = []
     try:
-        entry_url = _get_entry_url(items[0][1])
-        if entry_url:
-            print(f"  正在通过WAF验证...")
-            page.get(entry_url)
-            for _ in range(30):
-                time.sleep(2)
-                html = page.html
-                if not _is_waf_challenge(html):
-                    print(f"  WAF验证通过")
-                    break
-            if _is_waf_challenge(page.html):
-                print(f"  WAF验证未通过，尝试直接访问文章页面...")
-
-        for title, url in items:
+        for url in urls:
             try:
-                safe_title = re.sub(r'[\\/:*?"<>|]', "_", title[:80])
-                filename = f"{safe_title}.html"
-                filepath = os.path.join(site_dir, filename)
-
                 page.get(url)
-                for _ in range(30):
-                    time.sleep(2)
+                for _ in range(10):
+                    time.sleep(1)
                     html = page.html
-                    if not _is_waf_challenge(html):
+                    if len(html) > 1000 and "412" not in html[:500]:
+                        results.append(html)
                         break
-
-                html = page.html
-                if _is_waf_challenge(html):
-                    print(f"  浏览器下载失败(WAF挑战未通过) [{title[:30]}]")
-                    continue
-
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(html)
-                downloaded.append((title, url, filepath))
-                print(f"  已下载(浏览器): {filename}")
-            except Exception as e:
-                print(f"  浏览器下载失败 [{title[:30]}]: {e}")
+                else:
+                    results.append(page.html)
+            except Exception:
+                results.append(None)
+        return results
     finally:
         page.quit()
-
-    return downloaded
 
 
 def download_html_files(new_items: list[tuple[str, str]], site_key: str) -> list[tuple[str, str, str]]:
@@ -222,34 +159,48 @@ def download_html_files(new_items: list[tuple[str, str]], site_key: str) -> list
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
+    session = requests.Session()
+    session.trust_env = False
+
+    use_browser = any(waf in site_key for waf in WAF_SITES)
+
     downloaded = []
-    browser_items = []
-    regular_items = []
 
-    for title, url in new_items:
-        if _needs_browser(url):
-            browser_items.append((title, url))
-        else:
-            regular_items.append((title, url))
+    if use_browser and new_items:
+        urls = [url for _, url in new_items]
+        html_contents = _download_with_browser(urls)
 
-    for title, url in regular_items:
-        try:
-            safe_title = re.sub(r'[\\/:*?"<>|]', "_", title[:80])
-            filename = f"{safe_title}.html"
-            filepath = os.path.join(site_dir, filename)
+        for (title, url), html_content in zip(new_items, html_contents):
+            if not html_content:
+                print(f"  浏览器下载失败 [{title[:30]}]")
+                continue
+            try:
+                safe_title = re.sub(r'[\\/:*?"<>|]', "_", title[:80])
+                filename = f"{safe_title}.html"
+                filepath = os.path.join(site_dir, filename)
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                downloaded.append((title, url, filepath))
+                print(f"  已下载: {filename}")
+            except Exception as e:
+                print(f"  保存失败 [{title[:30]}]: {e}")
+    else:
+        for title, url in new_items:
+            try:
+                resp = session.get(url, headers=headers, timeout=15, verify=False)
+                resp.encoding = resp.apparent_encoding
 
-            resp = requests.get(url, headers=headers, timeout=15)
-            resp.encoding = resp.apparent_encoding
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(resp.text)
-            downloaded.append((title, url, filepath))
-            print(f"  已下载: {filename}")
-        except Exception as e:
-            print(f"  下载失败 [{title[:30]}]: {e}")
+                safe_title = re.sub(r'[\\/:*?"<>|]', "_", title[:80])
+                filename = f"{safe_title}.html"
+                filepath = os.path.join(site_dir, filename)
 
-    if browser_items:
-        batch_results = _download_batch_with_browser(browser_items, site_dir)
-        downloaded.extend(batch_results)
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(resp.text)
+
+                downloaded.append((title, url, filepath))
+                print(f"  已下载: {filename}")
+            except Exception as e:
+                print(f"  下载失败 [{title[:30]}]: {e}")
 
     return downloaded
 
@@ -438,7 +389,7 @@ def test_api_key(api_key: str, provider: str = "deepseek", model: str | None = N
     provider_name = "DeepSeek" if provider == "deepseek" else "OpenAI"
 
     try:
-        resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=30, verify=False)
         if resp.status_code == 200:
             return True, f"{provider_name} API连接测试成功 (模型: {actual_model})"
         elif resp.status_code == 401:
