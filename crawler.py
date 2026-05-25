@@ -251,12 +251,12 @@ def interactive_setup() -> dict:
         print("自启动模式:")
         print("  1. 控制台模式 (显示命令行窗口，直接运行爬虫)")
         print("  2. 静默模式 (不显示窗口，运行定时调度)")
-        print("  3. 运行后确认关闭 (执行一次爬取，显示结果后按回车关闭)")
+        print("  3. 运行后自动关闭 (执行一次爬取并推送后自动关闭)")
         mode_choice = input("请选择 (1/2/3, 默认: 1): ").strip()
         if mode_choice == "2":
             autostart_mode = "silent"
         elif mode_choice == "3":
-            autostart_mode = "run_once"
+            autostart_mode = "auto_close"
         else:
             autostart_mode = "console"
 
@@ -519,19 +519,34 @@ def init_records():
 
     db = DatabaseManager()
 
+    initialized_sites = []
+    uninitialized_sites = []
     for crawler in ALL_CRAWLERS:
+        if db.is_initialized(crawler.site_key):
+            initialized_sites.append(crawler)
+        else:
+            uninitialized_sites.append(crawler)
+
+    if initialized_sites:
+        print("\n以下网站已有记录：")
+        for crawler in initialized_sites:
+            count = db.get_record_count(crawler.site_key)
+            print(f"  [{crawler.site_name}] {count} 条记录")
+        reinit = input("\n是否重新初始化所有网站? (y/n, 默认: n): ").strip().lower() == "y"
+        if reinit:
+            for crawler in initialized_sites:
+                db.clear_records(crawler.site_key)
+            uninitialized_sites = ALL_CRAWLERS
+        else:
+            pass
+
+    sites_to_init = uninitialized_sites if initialized_sites else ALL_CRAWLERS
+    if not sites_to_init:
+        sites_to_init = ALL_CRAWLERS
+
+    for crawler in sites_to_init:
         site_key = crawler.site_key
         site_name = crawler.site_name
-
-        if db.is_initialized(site_key):
-            count = db.get_record_count(site_key)
-            choice = input(
-                f"[{site_name}] 已有 {count} 条记录，是否重新初始化? (y/n, 默认: n): "
-            ).strip().lower()
-            if choice != "y":
-                print(f"[{site_name}] 跳过初始化")
-                continue
-            db.clear_records(site_key)
 
         print(f"\n正在初始化 [{site_name}] ...")
         try:
@@ -586,8 +601,8 @@ def setup_autostart(enable: bool, mode: str | None = None):
         if getattr(sys, "frozen", False):
             if mode == "silent":
                 bat_content = f'@echo off\nstart "" /min "{exe_path}" --autostart-run\n'
-            elif mode == "run_once":
-                bat_content = f'@echo off\n"{exe_path}" --autostart-run-once\npause\n'
+            elif mode == "auto_close":
+                bat_content = f'@echo off\n"{exe_path}" --autostart-run-once\n'
             else:
                 bat_content = f'@echo off\n"{exe_path}" --autostart-run\n'
         else:
@@ -596,15 +611,15 @@ def setup_autostart(enable: bool, mode: str | None = None):
                 pythonw_exe = python_exe.replace("python.exe", "pythonw.exe")
                 exe_to_use = pythonw_exe if os.path.exists(pythonw_exe) else python_exe
                 bat_content = f'@echo off\nstart "" /min "{exe_to_use}" "{SCRIPT_DIR}\\crawler.py" --autostart-run\n'
-            elif mode == "run_once":
-                bat_content = f'@echo off\n"{python_exe}" "{SCRIPT_DIR}\\crawler.py" --autostart-run-once\npause\n'
+            elif mode == "auto_close":
+                bat_content = f'@echo off\n"{python_exe}" "{SCRIPT_DIR}\\crawler.py" --autostart-run-once\n'
             else:
                 bat_content = f'@echo off\n"{python_exe}" "{SCRIPT_DIR}\\crawler.py" --autostart-run\n'
 
         with open(bat_path, "w", encoding="utf-8") as f:
             f.write(bat_content)
 
-        mode_names = {"console": "控制台模式", "silent": "静默模式", "run_once": "运行后确认关闭模式"}
+        mode_names = {"console": "控制台模式", "silent": "静默模式", "auto_close": "运行后自动关闭模式"}
         print(f"已添加开机自启动 ({mode_names.get(mode, mode)}): {bat_path}")
 
         if config:
@@ -1070,6 +1085,48 @@ def _ai_edit_prompts(config: dict):
             break
 
 
+def config_autostart():
+    config = load_config()
+    if not config:
+        print("未找到配置文件，请先运行: python crawler.py init")
+        return
+
+    while True:
+        autostart = config.get("autostart", False)
+        mode = config.get("autostart_mode", "console")
+        mode_names = {"console": "控制台模式", "silent": "静默模式", "auto_close": "运行后自动关闭模式"}
+        current_mode_name = mode_names.get(mode, mode)
+
+        print("\n" + "=" * 50)
+        print("       开机自启动设置")
+        print("=" * 50)
+        print(f"  当前状态: {'已启用' if autostart else '已禁用'}")
+        if autostart:
+            print(f"  当前模式: {current_mode_name}")
+
+        print("\n请选择操作：")
+        print("  1. 控制台模式 (显示命令行窗口，直接运行爬虫)")
+        print("  2. 静默模式 (不显示窗口，运行定时调度)")
+        print("  3. 运行后自动关闭 (执行一次爬取并推送后自动关闭)")
+        print("  4. 关闭开机自启动")
+        print("  5. 返回主菜单")
+
+        choice = input("\n请输入选项编号: ").strip()
+
+        if choice in ("1", "2", "3"):
+            mode_map = {"1": "console", "2": "silent", "3": "auto_close"}
+            selected_mode = mode_map[choice]
+            setup_autostart(True, selected_mode)
+            config = load_config()
+        elif choice == "4":
+            setup_autostart(False)
+            config = load_config()
+        elif choice == "5":
+            break
+        else:
+            print("无效选项，请重新输入")
+
+
 def config_ai():
     config = load_config()
     if not config:
@@ -1096,6 +1153,38 @@ def config_ai():
             break
         else:
             print("无效选项，请重新输入")
+
+
+def show_database():
+    db = DatabaseManager()
+    site_keys = db.get_all_site_keys()
+
+    site_name_map = {c.site_key: c.site_name for c in ALL_CRAWLERS}
+
+    print("\n" + "=" * 50)
+    print("       数据库存储状态")
+    print("=" * 50)
+
+    if not site_keys:
+        print("\n  数据库为空，尚未初始化任何网站")
+        return
+
+    total = 0
+    for site_key in site_keys:
+        count = db.get_record_count(site_key)
+        site_name = site_name_map.get(site_key, site_key)
+        total += count
+        print(f"\n  [{site_name}] ({site_key})")
+        print(f"  记录数: {count}")
+        latest = db.get_latest_records(site_key, 3)
+        if latest:
+            print(f"  最近记录:")
+            for title, url, seen_at in latest:
+                print(f"    - {title[:50]}")
+                print(f"      {url[:70]}")
+                print(f"      录入时间: {seen_at}")
+
+    print(f"\n  共 {len(site_keys)} 个网站，{total} 条记录")
 
 
 def show_config():
@@ -1130,8 +1219,8 @@ def show_main_menu():
         ("启动定时调度器", has_config),
         ("测试比对与推送功能", has_config),
         ("AI智能摘要与筛选配置", has_config),
-        ("开启开机自启动", has_config),
-        ("关闭开机自启动", True),
+        ("开机自启动设置", has_config),
+        ("查看数据库存储状态", has_config),
         ("查看当前配置", has_config),
         ("退出程序", True),
     ]
@@ -1190,24 +1279,10 @@ def interactive_menu():
         elif num == 5:
             config_ai()
         elif num == 6:
-            print("\n" + "-" * 40)
-            print("请选择自启动模式:")
-            print("  1. 控制台模式 (显示命令行窗口，直接运行爬虫)")
-            print("  2. 静默模式 (不显示窗口，运行定时调度)")
-            print("  3. 运行后确认关闭 (执行一次爬取，显示结果后按回车关闭)")
-            mode_choice = input("请选择 (1/2/3, 默认: 1): ").strip()
-            if mode_choice == "2":
-                mode = "silent"
-            elif mode_choice == "3":
-                mode = "run_once"
-            else:
-                mode = "console"
-            setup_autostart(True, mode)
-            print("-" * 40)
-            input("\n按回车键继续...")
+            config_autostart()
         elif num == 7:
             print("\n" + "-" * 40)
-            setup_autostart(False)
+            show_database()
             print("-" * 40)
             input("\n按回车键继续...")
         elif num == 8:
@@ -1240,7 +1315,6 @@ def main():
     if "--autostart-run-once" in sys.argv:
         wait_for_network(config)
         run_crawl_and_notify()
-        input("\n按回车键关闭程序...")
         return
 
     if len(sys.argv) > 1 and sys.argv[1] not in ["--autostart-run", "--autostart-run-once"]:

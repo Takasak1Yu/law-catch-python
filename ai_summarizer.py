@@ -1,10 +1,21 @@
 import os
 import re
+import time
 import requests
 
 from db_manager import APP_DATA_DIR, ensure_app_data_dir
 
 HTML_SAVE_DIR = os.path.join(APP_DATA_DIR, "downloaded_pages")
+
+BROWSER_REQUIRED_DOMAINS = [
+    "customs.gov.cn",
+    "nmpa.gov.cn",
+]
+
+BROWSER_DOMAIN_ENTRY = {
+    "customs.gov.cn": "http://www.customs.gov.cn/customs/302249/302266/index.html",
+    "nmpa.gov.cn": "https://www.nmpa.gov.cn/hzhp/hzhpjmtg/index.html",
+}
 
 PROVIDERS = {
     "deepseek": {
@@ -96,6 +107,112 @@ def _extract_text(html_content: str) -> str:
     return text
 
 
+def _needs_browser(url: str) -> bool:
+    for domain in BROWSER_REQUIRED_DOMAINS:
+        if domain in url:
+            return True
+    return False
+
+
+def _get_entry_url(url: str) -> str | None:
+    for domain, entry_url in BROWSER_DOMAIN_ENTRY.items():
+        if domain in url:
+            return entry_url
+    return None
+
+
+def _is_waf_challenge(html: str) -> bool:
+    if not html:
+        return True
+    if "$_ts" in html and "r='m'" in html:
+        return True
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    body = soup.find("body")
+    if not body:
+        return True
+    text = body.get_text(strip=True)
+    return len(text) < 100
+
+
+def _get_edge_path() -> str | None:
+    paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _download_batch_with_browser(
+    items: list[tuple[str, str]], site_dir: str,
+) -> list[tuple[str, str, str]]:
+    from DrissionPage import ChromiumPage, ChromiumOptions
+
+    edge_path = _get_edge_path()
+    if not edge_path:
+        for title, url in items:
+            print(f"  浏览器下载失败(未找到Edge) [{title[:30]}]")
+        return []
+
+    co = ChromiumOptions()
+    co.set_paths(
+        browser_path=edge_path,
+        user_data_path=os.path.join(
+            os.environ.get("TEMP", ""), "crawl_ai_download_profile"
+        ),
+    )
+    co.set_argument("--no-sandbox")
+    co.set_argument("--disable-blink-features=AutomationControlled")
+
+    page = ChromiumPage(co)
+    downloaded = []
+    try:
+        entry_url = _get_entry_url(items[0][1])
+        if entry_url:
+            print(f"  正在通过WAF验证...")
+            page.get(entry_url)
+            for _ in range(30):
+                time.sleep(2)
+                html = page.html
+                if not _is_waf_challenge(html):
+                    print(f"  WAF验证通过")
+                    break
+            if _is_waf_challenge(page.html):
+                print(f"  WAF验证未通过，尝试直接访问文章页面...")
+
+        for title, url in items:
+            try:
+                safe_title = re.sub(r'[\\/:*?"<>|]', "_", title[:80])
+                filename = f"{safe_title}.html"
+                filepath = os.path.join(site_dir, filename)
+
+                page.get(url)
+                for _ in range(30):
+                    time.sleep(2)
+                    html = page.html
+                    if not _is_waf_challenge(html):
+                        break
+
+                html = page.html
+                if _is_waf_challenge(html):
+                    print(f"  浏览器下载失败(WAF挑战未通过) [{title[:30]}]")
+                    continue
+
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(html)
+                downloaded.append((title, url, filepath))
+                print(f"  已下载(浏览器): {filename}")
+            except Exception as e:
+                print(f"  浏览器下载失败 [{title[:30]}]: {e}")
+    finally:
+        page.quit()
+
+    return downloaded
+
+
 def download_html_files(new_items: list[tuple[str, str]], site_key: str) -> list[tuple[str, str, str]]:
     ensure_app_data_dir()
     site_dir = os.path.join(HTML_SAVE_DIR, site_key)
@@ -106,22 +223,33 @@ def download_html_files(new_items: list[tuple[str, str]], site_key: str) -> list
     }
 
     downloaded = []
-    for title, url in new_items:
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            resp.encoding = resp.apparent_encoding
+    browser_items = []
+    regular_items = []
 
+    for title, url in new_items:
+        if _needs_browser(url):
+            browser_items.append((title, url))
+        else:
+            regular_items.append((title, url))
+
+    for title, url in regular_items:
+        try:
             safe_title = re.sub(r'[\\/:*?"<>|]', "_", title[:80])
             filename = f"{safe_title}.html"
             filepath = os.path.join(site_dir, filename)
 
+            resp = requests.get(url, headers=headers, timeout=15)
+            resp.encoding = resp.apparent_encoding
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(resp.text)
-
             downloaded.append((title, url, filepath))
             print(f"  已下载: {filename}")
         except Exception as e:
             print(f"  下载失败 [{title[:30]}]: {e}")
+
+    if browser_items:
+        batch_results = _download_batch_with_browser(browser_items, site_dir)
+        downloaded.extend(batch_results)
 
     return downloaded
 

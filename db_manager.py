@@ -106,3 +106,18 @@ class DatabaseManager:
                 conn.execute("DELETE FROM crawl_records WHERE id = ?", (record_id,))
                 return (title, url)
             return None
+
+    def get_all_site_keys(self) -> list[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT DISTINCT site_key FROM crawl_records ORDER BY site_key"
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    def get_latest_records(self, site_key: str, limit: int = 5) -> list[tuple[str, str, str]]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT title, url, first_seen_at FROM crawl_records WHERE site_key = ? ORDER BY first_seen_at DESC LIMIT ?",
+                (site_key, limit),
+            )
+            return cursor.fetchall()
