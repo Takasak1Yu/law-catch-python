@@ -10,7 +10,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HTML_SAVE_DIR = os.path.join(APP_DATA_DIR, "downloaded_pages")
 
-WAF_SITES = ["customs_gov", "nhc_gov", "nmpa_"]
+WAF_SITES = ["customs_gov", "nhc_gov", "nmpa_", "miit_"]
+FLK_DOMAIN = "flk.npc.gov.cn"
 
 PROVIDERS = {
     "deepseek": {
@@ -113,6 +114,93 @@ def _get_edge_path() -> str | None:
     return None
 
 
+def _download_flk_pages(urls: list[str]) -> list[str | None]:
+    from DrissionPage import ChromiumPage, ChromiumOptions
+    from bs4 import BeautifulSoup
+
+    edge_path = _get_edge_path()
+    if not edge_path:
+        return [None] * len(urls)
+
+    co = ChromiumOptions()
+    co.set_paths(browser_path=edge_path, local_port=9228,
+                 user_data_path=os.path.join(os.environ.get("TEMP", ""), "download_flk_profile"))
+    co.set_argument("--no-sandbox")
+    co.set_argument("--disable-blink-features=AutomationControlled")
+    co.set_argument("--ignore-certificate-errors")
+    co.set_argument("--proxy-server='direct://'")
+    co.set_argument("--proxy-bypass-list=*")
+
+    page = ChromiumPage(co)
+    results = []
+    try:
+        for url in urls:
+            try:
+                page.get(url)
+                for _ in range(10):
+                    time.sleep(1)
+                    if len(page.html) > 5000:
+                        break
+
+                soup = BeautifulSoup(page.html, "html.parser")
+                text = soup.get_text(separator="\n", strip=True)
+
+                lines = [l.strip() for l in text.split("\n") if l.strip()]
+                
+                title = ""
+                for line in lines[:15]:
+                    if "中华人民共和国" in line and ("法" in line or "条例" in line):
+                        title = line
+                        break
+                if not title:
+                    for line in lines[:15]:
+                        if "法" in line and len(line) > 5 and len(line) < 50:
+                            title = line
+                            break
+                if not title:
+                    title = page.title.replace("undefined-", "").replace("-国家法律法规数据库", "").strip()
+
+                info = {}
+                for i, line in enumerate(lines):
+                    if line == "法律法规分类：" and i + 1 < len(lines):
+                        info["分类"] = lines[i + 1]
+                    elif line == "制定机关：" and i + 1 < len(lines):
+                        info["制定机关"] = lines[i + 1]
+                    elif line == "公布日期：" and i + 1 < len(lines):
+                        info["公布日期"] = lines[i + 1]
+                    elif line == "施行日期：" and i + 1 < len(lines):
+                        info["施行日期"] = lines[i + 1]
+                    elif "法律法规分类：" in line:
+                        info["分类"] = line.replace("法律法规分类：", "").strip()
+                    elif "制定机关：" in line:
+                        info["制定机关"] = line.replace("制定机关：", "").strip()
+                    elif "公布日期：" in line:
+                        info["公布日期"] = line.replace("公布日期：", "").strip()
+                    elif "施行日期：" in line:
+                        info["施行日期"] = line.replace("施行日期：", "").strip()
+
+                html_parts = [f"<h1>{title}</h1>", "<div class='flk-info'>"]
+                html_parts.append(f"<p><strong>来源：</strong>国家法律法规数据库</p>")
+                if "分类" in info:
+                    html_parts.append(f"<p><strong>法律法规分类：</strong>{info['分类']}</p>")
+                if "制定机关" in info:
+                    html_parts.append(f"<p><strong>制定机关：</strong>{info['制定机关']}</p>")
+                if "公布日期" in info:
+                    html_parts.append(f"<p><strong>公布日期：</strong>{info['公布日期']}</p>")
+                if "施行日期" in info:
+                    html_parts.append(f"<p><strong>施行日期：</strong>{info['施行日期']}</p>")
+                html_parts.append(f"<p><strong>原文链接：</strong><a href='{url}'>{url}</a></p>")
+                html_parts.append("<p><em>注：该法规正文需在国家法律法规数据库网站查看或下载。</em></p>")
+                html_parts.append("</div>")
+
+                results.append("\n".join(html_parts))
+            except Exception:
+                results.append(None)
+        return results
+    finally:
+        page.quit()
+
+
 def _download_with_browser(urls: list[str]) -> list[str | None]:
     from DrissionPage import ChromiumPage, ChromiumOptions
 
@@ -166,11 +254,34 @@ def download_html_files(new_items: list[tuple[str, str]], site_key: str) -> list
 
     downloaded = []
 
-    if use_browser and new_items:
-        urls = [url for _, url in new_items]
+    flk_items = [(t, u) for t, u in new_items if FLK_DOMAIN in u]
+    other_items = [(t, u) for t, u in new_items if FLK_DOMAIN not in u]
+
+    if flk_items:
+        print(f"  发现 {len(flk_items)} 条国家法律法规库链接，使用浏览器获取...")
+        urls = [url for _, url in flk_items]
+        html_contents = _download_flk_pages(urls)
+
+        for (title, url), html_content in zip(flk_items, html_contents):
+            if not html_content:
+                print(f"  法律法规库获取失败 [{title[:30]}]")
+                continue
+            try:
+                safe_title = re.sub(r'[\\/:*?"<>|]', "_", title[:80])
+                filename = f"{safe_title}.html"
+                filepath = os.path.join(site_dir, filename)
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                downloaded.append((title, url, filepath))
+                print(f"  已下载: {filename}")
+            except Exception as e:
+                print(f"  保存失败 [{title[:30]}]: {e}")
+
+    if use_browser and other_items:
+        urls = [url for _, url in other_items]
         html_contents = _download_with_browser(urls)
 
-        for (title, url), html_content in zip(new_items, html_contents):
+        for (title, url), html_content in zip(other_items, html_contents):
             if not html_content:
                 print(f"  浏览器下载失败 [{title[:30]}]")
                 continue
@@ -184,8 +295,8 @@ def download_html_files(new_items: list[tuple[str, str]], site_key: str) -> list
                 print(f"  已下载: {filename}")
             except Exception as e:
                 print(f"  保存失败 [{title[:30]}]: {e}")
-    else:
-        for title, url in new_items:
+    elif other_items:
+        for title, url in other_items:
             try:
                 resp = session.get(url, headers=headers, timeout=15, verify=False)
                 resp.encoding = resp.apparent_encoding

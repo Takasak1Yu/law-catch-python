@@ -478,6 +478,146 @@ class MemGovCrawler(BaseCrawler):
         return results
 
 
+class MemGovFdzdgkCrawler(BaseCrawler):
+    site_key = "mem_gov_fdzdgk"
+    site_name = "应急管理部非煤矿山安全监管"
+
+    URL = "https://www.mem.gov.cn/gk/zfxxgkpt/fdzdgknr/"
+    IFRAME_SRC = "https://www.mem.gov.cn/gk/zfxxgkpt/fdzdgknr/46/index_1771.shtml"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+    def crawl(self) -> list[tuple[str, str]]:
+        from urllib.parse import urljoin
+
+        resp = requests.get(self.IFRAME_SRC, headers=self.HEADERS, timeout=15, verify=False)
+        resp.encoding = resp.apparent_encoding
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        results = []
+        seen_urls = set()
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            title = a_tag.get_text(strip=True)
+            if not title:
+                continue
+            if href.startswith("#") or href.startswith("javascript"):
+                continue
+            if not (".shtml" in href or ".html" in href or ".htm" in href
+                    or "flk.npc.gov.cn" in href or ".pdf" in href):
+                continue
+            full_url = urljoin(self.IFRAME_SRC, href)
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            results.append((title, full_url))
+
+        return results
+
+
+class MiitCrawler(BaseCrawler):
+    URL: str = ""
+    LINK_KEYWORD = "art_"
+
+    def _get_edge_path(self) -> str | None:
+        paths = [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+        for p in paths:
+            if os.path.exists(p):
+                return p
+        return None
+
+    def crawl(self) -> list[tuple[str, str]]:
+        from urllib.parse import urljoin
+
+        edge_path = self._get_edge_path()
+        if not edge_path:
+            raise RuntimeError("未找到Edge浏览器，无法爬取工信部网站")
+
+        co = ChromiumOptions()
+        co.set_paths(browser_path=edge_path, local_port=9226,
+                     user_data_path=os.path.join(os.environ.get("TEMP", ""), "crawl_miit_profile"))
+        co.set_argument("--no-sandbox")
+        co.set_argument("--disable-blink-features=AutomationControlled")
+        co.set_argument("--ignore-certificate-errors")
+        co.set_argument("--proxy-server='direct://'")
+        co.set_argument("--proxy-bypass-list=*")
+
+        page = ChromiumPage(co)
+        try:
+            page.get(self.URL)
+
+            for _ in range(15):
+                time.sleep(2)
+                html = page.html
+                if len(html) > 5000:
+                    break
+
+            soup = BeautifulSoup(html, "html.parser")
+
+            results = []
+            seen = set()
+            for a_tag in soup.find_all("a", href=True):
+                href = a_tag["href"]
+                title = a_tag.get_text(strip=True)
+                if not title or not href:
+                    continue
+                if self.LINK_KEYWORD not in href:
+                    continue
+                if not (".html" in href or ".shtml" in href or ".htm" in href):
+                    continue
+                if len(title) <= 5:
+                    continue
+                full_url = urljoin(self.URL, href)
+                if full_url in seen:
+                    continue
+                seen.add(full_url)
+                results.append((title, full_url))
+
+            return results
+        finally:
+            page.quit()
+
+
+class MiitZcwjkCrawler(MiitCrawler):
+    site_key = "miit_zcwjk"
+    site_name = "工信部政策文件库"
+    URL = "https://www.miit.gov.cn/search/zcwjk.html?websiteid=110000000000000&pg=&p=&tpl=14&category=183&q="
+
+
+class MiitFlfgCrawler(MiitCrawler):
+    site_key = "miit_flfg"
+    site_name = "工信部法律法规"
+    URL = "https://www.miit.gov.cn/zwgk/zcwj/flfg/index.html"
+
+
+class MiitBmgzkCrawler(MiitCrawler):
+    site_key = "miit_bmgzk"
+    site_name = "工信部部门规章库"
+    URL = "https://www.miit.gov.cn/search/bmgzk.html?websiteid=110000000000000&pg=&p=&tpl=14&category=181&q="
+
+
+class MiitXzgfxwjCrawler(MiitCrawler):
+    site_key = "miit_xzgfxwj"
+    site_name = "工信部行政规范性文件"
+    URL = "https://www.miit.gov.cn/search/zcwjk.html?websiteid=110000000000000&pg=&p=&tpl=14&category=46&q="
+
+
+class MiitWjgsCrawler(MiitCrawler):
+    site_key = "miit_wjgs"
+    site_name = "工信部文件公示"
+    URL = "https://www.miit.gov.cn/zwgk/wjgs/index.html"
+
+
+class MiitHdjlCrawler(MiitCrawler):
+    site_key = "miit_hdjl"
+    site_name = "工信部互动交流"
+    URL = "https://www.miit.gov.cn/hdjl/index.html"
+
+
 ALL_CRAWLERS: list[BaseCrawler] = [
     MeeGovCrawler(),
     MeeGovGzkCrawler(),
@@ -495,4 +635,11 @@ ALL_CRAWLERS: list[BaseCrawler] = [
     CustomsGovCrawler(),
     ShMsaCrawler(),
     MemGovCrawler(),
+    MemGovFdzdgkCrawler(),
+    MiitZcwjkCrawler(),
+    MiitFlfgCrawler(),
+    MiitBmgzkCrawler(),
+    MiitXzgfxwjCrawler(),
+    MiitWjgsCrawler(),
+    MiitHdjlCrawler(),
 ]
