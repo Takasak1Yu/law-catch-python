@@ -1,12 +1,26 @@
 import os
 import re
 import time
+import socket
 import requests
 import urllib3
 
 from db_manager import APP_DATA_DIR, ensure_app_data_dir
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def wait_for_port_free(port: int, timeout: int = 30, interval: float = 1.0):
+    """等待端口释放，若端口被占用则循环检测直到超时"""
+    start = time.time()
+    while time.time() - start < timeout:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            result = s.connect_ex(("127.0.0.1", port))
+            if result != 0:
+                return True
+        time.sleep(interval)
+    return False
 
 HTML_SAVE_DIR = os.path.join(APP_DATA_DIR, "downloaded_pages")
 
@@ -131,6 +145,7 @@ def _download_flk_pages(urls: list[str]) -> list[str | None]:
     co.set_argument("--proxy-server='direct://'")
     co.set_argument("--proxy-bypass-list=*")
 
+    wait_for_port_free(9228)
     page = ChromiumPage(co)
     results = []
     try:
@@ -199,6 +214,7 @@ def _download_flk_pages(urls: list[str]) -> list[str | None]:
         return results
     finally:
         page.quit()
+        time.sleep(3)
 
 
 def _download_with_browser(urls: list[str]) -> list[str | None]:
@@ -217,6 +233,7 @@ def _download_with_browser(urls: list[str]) -> list[str | None]:
     co.set_argument("--proxy-server='direct://'")
     co.set_argument("--proxy-bypass-list=*")
 
+    wait_for_port_free(9227)
     page = ChromiumPage(co)
     results = []
     try:
@@ -236,6 +253,7 @@ def _download_with_browser(urls: list[str]) -> list[str | None]:
         return results
     finally:
         page.quit()
+        time.sleep(3)
 
 
 def download_html_files(new_items: list[tuple[str, str]], site_key: str) -> list[tuple[str, str, str]]:

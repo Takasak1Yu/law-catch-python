@@ -16,9 +16,17 @@ from ai_summarizer import (
     DEFAULT_SUMMARY_PROMPT, KEYWORD_FILTER_PROMPT, BLOCKLIST_FILTER_PROMPT,
 )
 from email_sender import EmailSender
-from site_crawlers import ALL_CRAWLERS
+from site_crawlers import ALL_CRAWLERS, kill_crawler_browsers
+from generate_excel import generate_results_excel
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def clear_screen():
+    """清空终端窗口"""
+    os.system("cls" if os.name == "nt" else "clear")
+
+
 CONFIG_PATH = os.path.join(APP_DATA_DIR, "config.json")
 AUTOSTART_BAT_NAME = "crawl_monitor.bat"
 HTML_SAVE_DIR = os.path.join(APP_DATA_DIR, "downloaded_pages")
@@ -141,6 +149,9 @@ def _migrate_ai_config(config: dict) -> bool:
         if "summary_prompt" not in ai:
             ai["summary_prompt"] = ""
             changed = True
+        if "excel_attachment" not in ai:
+            ai["excel_attachment"] = True
+            changed = True
 
     if "ai_summary" not in config:
         config["ai_summary"] = {
@@ -151,6 +162,7 @@ def _migrate_ai_config(config: dict) -> bool:
             "keyword_filter": {"enabled": False, "keywords": [], "custom_prompt": ""},
             "blocklist_filter": {"enabled": False, "blockwords": [], "custom_prompt": ""},
             "summary_prompt": "",
+            "excel_attachment": True,
         }
         changed = True
 
@@ -167,6 +179,9 @@ def load_config() -> dict | None:
         config["network_wait"] = {"enabled": True, "timeout": 5}
         changed = True
     if _migrate_ai_config(config):
+        changed = True
+    if "crawl_retry" not in config:
+        config["crawl_retry"] = {"enabled": True, "max_retries": 3}
         changed = True
     if changed:
         save_config(config)
@@ -203,6 +218,32 @@ def _apply_ai_to_new_items(new_items, site_key, site_name, ai_config):
         print(f"  [{site_name}] 已过滤 {len(filtered_items)} 条不相关通知")
 
     return email_items, summaries
+
+
+def _crawl_with_retry(crawler, retry_config: dict) -> tuple[str, list]:
+    """带重试逻辑的爬取函数，返回 (status, records)
+    status: 'success' | 'error' | 'empty'
+    """
+    max_retries = retry_config.get("max_retries", 3) if retry_config.get("enabled", True) else 1
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            records = crawler.crawl()
+            if records:
+                return "success", records
+            if attempt < max_retries:
+                print(f"  [{crawler.site_name}] 爬取结果为空，第 {attempt}/{max_retries} 次重试...")
+                kill_crawler_browsers()
+                continue
+            return "empty", []
+        except Exception as e:
+            if attempt < max_retries:
+                print(f"  [{crawler.site_name}] 爬取异常: {e}，第 {attempt}/{max_retries} 次重试...")
+                kill_crawler_browsers()
+                continue
+            return "error", [str(e)]
+
+    return "empty", []
 
 
 def interactive_setup() -> dict:
@@ -358,16 +399,21 @@ def interactive_setup() -> dict:
             "keyword_filter": keyword_filter,
             "blocklist_filter": blocklist_filter,
             "summary_prompt": summary_prompt,
+            "excel_attachment": True,
         },
         "network_wait": {
             "enabled": enable_network_wait,
             "timeout": wait_timeout
-        }
+        },
+        "crawl_retry": {
+            "enabled": True,
+            "max_retries": 3,
+        },
     }
 
     save_config(config)
     print(f"\n配置已保存到 {CONFIG_PATH}")
-    print("提示: 可通过主菜单「AI智能摘要与筛选配置」进一步调整各项设置")
+    print("提示: 可通过主菜单「智能功能与爬取设置」进一步调整各项设置")
     return config
 
 
@@ -381,6 +427,7 @@ def run_crawl_and_notify():
     db = DatabaseManager()
     email = EmailSender(config["email"])
     ai_config = config.get("ai_summary", {})
+    retry_config = config.get("crawl_retry", {"enabled": True, "max_retries": 3})
 
     all_results = []
 
@@ -401,21 +448,21 @@ def run_crawl_and_notify():
             )
             continue
 
-        try:
-            records = crawler.crawl()
-        except Exception as e:
+        status, records = _crawl_with_retry(crawler, retry_config)
+
+        if status == "error":
             all_results.append(
                 {
                     "site_name": site_name,
                     "site_key": site_key,
                     "status": "error",
-                    "message": f"爬取失败: {e}",
+                    "message": f"爬取失败: {records[0] if records else '未知错误'}",
                     "new_items": [],
                 }
             )
             continue
 
-        if not records:
+        if status == "empty":
             all_results.append(
                 {
                     "site_name": site_name,
@@ -460,8 +507,18 @@ def run_crawl_and_notify():
 
     subject, body = compose_email(all_results)
 
+    attachments = []
+    if ai_config.get("excel_attachment", True):
+        try:
+            excel_path = generate_results_excel(all_results)
+            if excel_path:
+                attachments.append(excel_path)
+                print(f"Excel附件已生成: {excel_path}")
+        except Exception as e:
+            print(f"Excel附件生成失败: {e}")
+
     try:
-        email.send(subject, body)
+        email.send(subject, body, attachments if attachments else None)
         print("邮件已发送")
     except Exception as e:
         print(f"邮件发送失败: {e}")
@@ -474,15 +531,17 @@ def compose_email(results: list[dict]) -> tuple[str, str]:
     has_error = False
     body_parts = []
 
+    separator = "━" * 50
+
     for result in results:
         site_name = result["site_name"]
         status = result["status"]
 
         if status == "error":
             has_error = True
-            body_parts.append(f"【{site_name}】\n状态：异常\n{result['message']}\n")
+            body_parts.append(f"{separator}\n【{site_name}】\n状态：异常\n{result['message']}\n")
         elif status == "normal":
-            body_parts.append(f"【{site_name}】\n状态：正常\n{result['message']}\n")
+            body_parts.append(f"{separator}\n【{site_name}】\n状态：正常\n{result['message']}\n")
         elif status == "update":
             new_count = len(result["new_items"])
             total_new += new_count
@@ -496,13 +555,14 @@ def compose_email(results: list[dict]) -> tuple[str, str]:
             items_text = "\n".join(items_lines)
             msg = result.get("message", "")
             header = f"【{site_name}】{msg}"
-            body_parts.append(f"{header}\n{items_text}\n")
+            body_parts.append(f"{separator}\n{header}\n{items_text}\n")
         elif status == "not_initialized":
             has_error = True
-            body_parts.append(f"【{site_name}】\n状态：未初始化\n{result['message']}\n")
+            body_parts.append(f"{separator}\n【{site_name}】\n状态：未初始化\n{result['message']}\n")
 
     status_text = "异常" if has_error else "正常"
     subject = f"法规监控报告-{total_new}条新通知-程序运行状态{status_text}"
+    body_parts.append(separator)
     body = "\n".join(body_parts)
 
     return subject, body
@@ -681,6 +741,7 @@ def test_compare_and_push():
     db = DatabaseManager()
     email = EmailSender(config["email"])
     ai_config = config.get("ai_summary", {})
+    retry_config = config.get("crawl_retry", {"enabled": True, "max_retries": 3})
 
     print("=" * 50)
     print("       测试比对与推送功能")
@@ -709,22 +770,22 @@ def test_compare_and_push():
         print(f"  标题: {deleted_title}")
         print(f"  链接: {deleted_url}")
 
-        try:
-            records = crawler.crawl()
-        except Exception as e:
+        status, records = _crawl_with_retry(crawler, retry_config)
+
+        if status == "error":
             all_results.append(
                 {
                     "site_name": site_name,
                     "site_key": site_key,
                     "status": "error",
-                    "message": f"爬取失败: {e}",
+                    "message": f"爬取失败: {records[0] if records else '未知错误'}",
                     "new_items": [],
                 }
             )
             db.insert_records(site_key, [deleted_record])
             continue
 
-        if not records:
+        if status == "empty":
             all_results.append(
                 {
                     "site_name": site_name,
@@ -777,6 +838,16 @@ def test_compare_and_push():
 
     subject, body = compose_email(all_results)
 
+    attachments = []
+    if ai_config.get("excel_attachment", True):
+        try:
+            excel_path = generate_results_excel(all_results)
+            if excel_path:
+                attachments.append(excel_path)
+                print(f"Excel附件已生成: {excel_path}")
+        except Exception as e:
+            print(f"Excel附件生成失败: {e}")
+
     print("\n" + "-" * 40)
     print("邮件内容预览:")
     print("-" * 40)
@@ -784,13 +855,13 @@ def test_compare_and_push():
     print(f"\n{body}")
 
     try:
-        email.send(subject, body)
+        email.send(subject, body, attachments if attachments else None)
         print("\n邮件已发送")
     except Exception as e:
         print(f"\n邮件发送失败: {e}")
 
 
-def _show_ai_submenu(ai: dict):
+def _show_ai_submenu(ai: dict, retry: dict):
     enabled = ai.get("enabled", False)
     provider = ai.get("provider", "deepseek")
     model = ai.get("model", "")
@@ -801,7 +872,7 @@ def _show_ai_submenu(ai: dict):
     provider_name = "DeepSeek" if provider == "deepseek" else "OpenAI"
 
     print("\n" + "=" * 50)
-    print("       AI智能摘要与筛选配置")
+    print("       智能功能与爬取设置")
     print("=" * 50)
     print(f"  AI智能摘要: {'已启用' if enabled else '已禁用'}")
     if enabled:
@@ -821,6 +892,11 @@ def _show_ai_submenu(ai: dict):
         print(f" ({', '.join(bw['blockwords'])})")
     else:
         print()
+    excel_att = ai.get("excel_attachment", True)
+    print(f"  Excel附件: {'已启用' if excel_att else '已禁用'}")
+    retry_enabled = retry.get("enabled", True)
+    retry_max = retry.get("max_retries", 3)
+    print(f"  爬取异常重试: {'已启用' if retry_enabled else '已禁用'}" + (f" (最大重试{retry_max}次)" if retry_enabled else ""))
 
     print("\n请选择操作：")
     print("  1. 启用/禁用AI智能摘要")
@@ -828,7 +904,9 @@ def _show_ai_submenu(ai: dict):
     print("  3. 关键词筛选设置")
     print("  4. 屏蔽词筛选设置")
     print("  5. 提示词查看与编辑")
-    print("  6. 返回主菜单")
+    print("  6. 启用/禁用Excel附件发送")
+    print("  7. 爬取异常自动重试设置")
+    print("  8. 返回主菜单")
 
 
 def _ai_toggle_enable(config: dict):
@@ -838,6 +916,57 @@ def _ai_toggle_enable(config: dict):
     ai["enabled"] = new_state
     save_config(config)
     print(f"\nAI智能摘要已{'启用' if new_state else '禁用'}")
+
+
+def _ai_toggle_excel_attachment(config: dict):
+    ai = config["ai_summary"]
+    current = ai.get("excel_attachment", True)
+    ai["excel_attachment"] = not current
+    save_config(config)
+    print(f"\nExcel附件发送已{'启用' if not current else '禁用'}")
+
+
+def _config_retry(config: dict):
+    retry = config.get("crawl_retry", {"enabled": True, "max_retries": 3})
+    current_enabled = retry.get("enabled", True)
+    current_max = retry.get("max_retries", 3)
+
+    print(f"\n爬取异常自动重试: {'已启用' if current_enabled else '已禁用'}")
+    print(f"当前最大重试次数: {current_max}")
+
+    print("\n请选择操作:")
+    print("  1. 启用/禁用重试")
+    print("  2. 修改最大重试次数")
+    print("  3. 返回上级菜单")
+
+    while True:
+        choice = input("\n请选择: ").strip()
+        if choice == "1":
+            config["crawl_retry"]["enabled"] = not current_enabled
+            save_config(config)
+            print(f"\n爬取异常重试已{'启用' if not current_enabled else '禁用'}")
+            break
+        elif choice == "2":
+            max_input = input(f"请输入最大重试次数 (1-10, 默认: {current_max}): ").strip()
+            if max_input:
+                try:
+                    new_max = int(max_input)
+                    if 1 <= new_max <= 10:
+                        config["crawl_retry"]["max_retries"] = new_max
+                        save_config(config)
+                        print(f"\n最大重试次数已设置为 {new_max}")
+                        break
+                    else:
+                        print("请输入1-10之间的数字")
+                except ValueError:
+                    print("输入无效，请输入数字")
+            else:
+                print("未修改")
+                break
+        elif choice == "3":
+            break
+        else:
+            print("无效选项，请重新输入")
 
 
 def _ai_config_api(config: dict):
@@ -978,6 +1107,7 @@ def _ai_edit_prompts(config: dict):
         bw_prompt = ai.get("blocklist_filter", {}).get("custom_prompt", "")
         summary_prompt = ai.get("summary_prompt", "")
 
+        clear_screen()
         print("\n" + "-" * 40)
         print("  提示词查看与编辑")
         print("-" * 40)
@@ -1097,6 +1227,7 @@ def config_autostart():
         mode_names = {"console": "控制台模式", "silent": "静默模式", "auto_close": "运行后自动关闭模式"}
         current_mode_name = mode_names.get(mode, mode)
 
+        clear_screen()
         print("\n" + "=" * 50)
         print("       开机自启动设置")
         print("=" * 50)
@@ -1135,7 +1266,9 @@ def config_ai():
 
     while True:
         ai = config.get("ai_summary", {})
-        _show_ai_submenu(ai)
+        retry = config.get("crawl_retry", {"enabled": True, "max_retries": 3})
+        clear_screen()
+        _show_ai_submenu(ai, retry)
 
         choice = input("\n请输入选项编号: ").strip()
 
@@ -1150,6 +1283,10 @@ def config_ai():
         elif choice == "5":
             _ai_edit_prompts(config)
         elif choice == "6":
+            _ai_toggle_excel_attachment(config)
+        elif choice == "7":
+            _config_retry(config)
+        elif choice == "8":
             break
         else:
             print("无效选项，请重新输入")
@@ -1218,7 +1355,7 @@ def show_main_menu():
         ("立即执行爬取并邮件通知", has_config),
         ("启动定时调度器", has_config),
         ("测试比对与推送功能", has_config),
-        ("AI智能摘要与筛选配置", has_config),
+        ("智能功能与爬取设置", has_config),
         ("开机自启动设置", has_config),
         ("查看数据库存储状态", has_config),
         ("查看当前配置", has_config),
@@ -1236,42 +1373,54 @@ def show_main_menu():
 
 
 def interactive_menu():
+    need_clear = True
     while True:
+        if need_clear:
+            clear_screen()
         options = show_main_menu()
+        need_clear = True
 
         try:
             choice = input("\n请输入选项编号: ").strip()
             if not choice:
+                need_clear = False
                 continue
             num = int(choice)
         except ValueError:
             print("输入无效，请输入数字")
+            need_clear = False
             continue
 
         if num < 1 or num > len(options):
             print(f"请输入 1-{len(options)} 之间的数字")
+            need_clear = False
             continue
 
         text, available = options[num - 1]
         if not available:
             print("该选项需要先执行初始化（选项1）")
+            need_clear = False
             continue
 
         if num == 1:
+            clear_screen()
             print("\n" + "-" * 40)
             init_records()
             print("-" * 40)
             input("\n按回车键继续...")
         elif num == 2:
+            clear_screen()
             print("\n" + "-" * 40)
             run_crawl_and_notify()
             print("-" * 40)
             input("\n按回车键继续...")
         elif num == 3:
+            clear_screen()
             print("\n" + "-" * 40)
             start_scheduler()
             print("-" * 40)
         elif num == 4:
+            clear_screen()
             print("\n" + "-" * 40)
             test_compare_and_push()
             print("-" * 40)
@@ -1281,11 +1430,13 @@ def interactive_menu():
         elif num == 6:
             config_autostart()
         elif num == 7:
+            clear_screen()
             print("\n" + "-" * 40)
             show_database()
             print("-" * 40)
             input("\n按回车键继续...")
         elif num == 8:
+            clear_screen()
             print("\n" + "-" * 40)
             show_config()
             print("-" * 40)
@@ -1329,7 +1480,7 @@ def main():
         autostart_parser.add_argument("action", choices=["on", "off"], help="on=开启, off=关闭")
 
         subparsers.add_parser("config", help="查看当前配置")
-        subparsers.add_parser("ai", help="配置AI智能摘要与筛选")
+        subparsers.add_parser("ai", help="配置智能功能与爬取设置")
 
         args = parser.parse_args()
 

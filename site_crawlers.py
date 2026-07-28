@@ -1,5 +1,7 @@
 import os
 import time
+import socket
+import subprocess
 import requests
 import urllib3
 from bs4 import BeautifulSoup
@@ -7,6 +9,39 @@ from abc import ABC, abstractmethod
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+CRAWLER_PORTS = [9223, 9224, 9225, 9226, 9227, 9228]
+
+
+def wait_for_port_free(port: int, timeout: int = 30, interval: float = 1.0):
+    """等待端口释放，若端口被占用则循环检测直到超时"""
+    start = time.time()
+    while time.time() - start < timeout:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            result = s.connect_ex(("127.0.0.1", port))
+            if result != 0:
+                return True
+        time.sleep(interval)
+    return False
+
+
+def kill_crawler_browsers():
+    """关闭所有爬虫调用的Edge浏览器进程"""
+    try:
+        subprocess.run(
+            [
+                "powershell", "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
+                "Where-Object { $_.CommandLine -match 'crawl_|download_' } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        pass
+    time.sleep(2)
 
 
 class BaseCrawler(ABC):
@@ -108,6 +143,7 @@ class NhcGovCrawler(BaseCrawler):
         co.set_argument("--proxy-server='direct://'")
         co.set_argument("--proxy-bypass-list=*")
 
+        wait_for_port_free(9223)
         page = ChromiumPage(co)
         try:
             page.get(self.URL)
@@ -137,6 +173,7 @@ class NhcGovCrawler(BaseCrawler):
             return results
         finally:
             page.quit()
+            time.sleep(3)
 
 
 class MeeGovGtfwSubCrawler(BaseCrawler):
@@ -284,6 +321,7 @@ class NmpaCrawler(BaseCrawler):
         co.set_argument("--proxy-server='direct://'")
         co.set_argument("--proxy-bypass-list=*")
 
+        wait_for_port_free(9224)
         page = ChromiumPage(co)
         try:
             page.get(self.URL)
@@ -321,6 +359,7 @@ class NmpaCrawler(BaseCrawler):
             return results
         finally:
             page.quit()
+            time.sleep(3)
 
 
 class NmpaHzhpjmtgCrawler(NmpaCrawler):
@@ -333,6 +372,12 @@ class NmpaHzhpfgwjCrawler(NmpaCrawler):
     site_key = "nmpa_hzhpfgwj"
     site_name = "国家药监局化妆品法规文件"
     URL = "https://www.nmpa.gov.cn/hzhp/hzhpfgwj/index.html"
+
+
+class NmpaXxgkFgwjCrawler(NmpaCrawler):
+    site_key = "nmpa_xxgk_fgwj"
+    site_name = "国家药监局法规文件"
+    URL = "https://www.nmpa.gov.cn/xxgk/fgwj/index.html"
 
 
 class CustomsGovCrawler(BaseCrawler):
@@ -368,6 +413,7 @@ class CustomsGovCrawler(BaseCrawler):
         co.set_argument("--proxy-server='direct://'")
         co.set_argument("--proxy-bypass-list=*")
 
+        wait_for_port_free(9225)
         page = ChromiumPage(co)
         try:
             page.get(self.URL)
@@ -405,6 +451,7 @@ class CustomsGovCrawler(BaseCrawler):
             return results
         finally:
             page.quit()
+            time.sleep(3)
 
 
 class ShMsaCrawler(BaseCrawler):
@@ -480,7 +527,7 @@ class MemGovCrawler(BaseCrawler):
 
 class MemGovFdzdgkCrawler(BaseCrawler):
     site_key = "mem_gov_fdzdgk"
-    site_name = "应急管理部非煤矿山安全监管"
+    site_name = "应急管理部政府信息公开"
 
     URL = "https://www.mem.gov.cn/gk/zfxxgkpt/fdzdgknr/"
     IFRAME_SRC = "https://www.mem.gov.cn/gk/zfxxgkpt/fdzdgknr/46/index_1771.shtml"
@@ -546,6 +593,7 @@ class MiitCrawler(BaseCrawler):
         co.set_argument("--proxy-server='direct://'")
         co.set_argument("--proxy-bypass-list=*")
 
+        wait_for_port_free(9226)
         page = ChromiumPage(co)
         try:
             page.get(self.URL)
@@ -580,6 +628,7 @@ class MiitCrawler(BaseCrawler):
             return results
         finally:
             page.quit()
+            time.sleep(3)
 
 
 class MiitZcwjkCrawler(MiitCrawler):
@@ -632,6 +681,7 @@ ALL_CRAWLERS: list[BaseCrawler] = [
     NifdcGgtzhCrawler(),
     NmpaHzhpjmtgCrawler(),
     NmpaHzhpfgwjCrawler(),
+    NmpaXxgkFgwjCrawler(),
     CustomsGovCrawler(),
     ShMsaCrawler(),
     MemGovCrawler(),
