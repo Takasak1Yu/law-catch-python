@@ -16,7 +16,7 @@ from ai_summarizer import (
     DEFAULT_SUMMARY_PROMPT, KEYWORD_FILTER_PROMPT, BLOCKLIST_FILTER_PROMPT,
 )
 from email_sender import EmailSender
-from site_crawlers import ALL_CRAWLERS, kill_crawler_browsers
+from site_crawlers import ALL_CRAWLERS, kill_crawler_browsers, classify_crawl_error, check_site_reachable
 from generate_excel import generate_results_excel
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -181,7 +181,10 @@ def load_config() -> dict | None:
     if _migrate_ai_config(config):
         changed = True
     if "crawl_retry" not in config:
-        config["crawl_retry"] = {"enabled": True, "max_retries": 3}
+        config["crawl_retry"] = {"enabled": True, "max_retries": 3, "retry_interval": 5}
+        changed = True
+    elif "retry_interval" not in config["crawl_retry"]:
+        config["crawl_retry"]["retry_interval"] = 5
         changed = True
     if changed:
         save_config(config)
@@ -220,30 +223,58 @@ def _apply_ai_to_new_items(new_items, site_key, site_name, ai_config):
     return email_items, summaries
 
 
-def _crawl_with_retry(crawler, retry_config: dict) -> tuple[str, list]:
-    """带重试逻辑的爬取函数，返回 (status, records)
+def _crawler_target_url(crawler) -> str:
+    """获取爬虫目标站点URL（用于网络可达性检测）"""
+    for attr in ("URL", "IFRAME_URL", "IFRAME_SRC"):
+        url = getattr(crawler, attr, "")
+        if url:
+            return url
+    return ""
+
+
+def _crawl_with_retry(crawler, retry_config: dict) -> tuple[str, list, dict | None]:
+    """带重试逻辑的爬取函数，返回 (status, records, error_info)
     status: 'success' | 'error' | 'empty'
+    error_info: {"kind": "network"|"software", "detail": str}，成功时为 None
     """
     max_retries = retry_config.get("max_retries", 3) if retry_config.get("enabled", True) else 1
+    retry_interval = retry_config.get("retry_interval", 5)
 
+    last_error: BaseException | None = None
     for attempt in range(1, max_retries + 1):
         try:
             records = crawler.crawl()
             if records:
-                return "success", records
+                return "success", records, None
             if attempt < max_retries:
-                print(f"  [{crawler.site_name}] 爬取结果为空，第 {attempt}/{max_retries} 次重试...")
+                print(f"  [{crawler.site_name}] 爬取结果为空，{retry_interval}秒后进行第 {attempt}/{max_retries} 次重试...")
                 kill_crawler_browsers()
+                time.sleep(retry_interval)
                 continue
-            return "empty", []
-        except Exception as e:
-            if attempt < max_retries:
-                print(f"  [{crawler.site_name}] 爬取异常: {e}，第 {attempt}/{max_retries} 次重试...")
-                kill_crawler_browsers()
-                continue
-            return "error", [str(e)]
 
-    return "empty", []
+            # 重试耗尽仍为空：区分网络不可达（环境问题）与网页结构变化（程序问题）
+            target = _crawler_target_url(crawler)
+            if target:
+                reachable, reason = check_site_reachable(target)
+            else:
+                reachable, reason = True, ""
+            if reachable:
+                return "empty", [], {
+                    "kind": "software",
+                    "detail": "网站可访问但未解析到任何列表条目，网页结构可能已变化，需更新爬虫规则",
+                }
+            return "empty", [], {"kind": "network", "detail": reason or "网站暂时无法访问"}
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                print(f"  [{crawler.site_name}] 爬取异常: {e}，{retry_interval}秒后进行第 {attempt}/{max_retries} 次重试...")
+                kill_crawler_browsers()
+                time.sleep(retry_interval)
+                continue
+
+    kind = classify_crawl_error(last_error) if last_error else "software"
+    detail = f"{type(last_error).__name__}: {last_error}" if last_error else "未知错误"
+    return "error", [], {"kind": kind, "detail": detail}
 
 
 def interactive_setup() -> dict:
@@ -408,6 +439,7 @@ def interactive_setup() -> dict:
         "crawl_retry": {
             "enabled": True,
             "max_retries": 3,
+            "retry_interval": 5,
         },
     }
 
@@ -448,7 +480,9 @@ def run_crawl_and_notify():
             )
             continue
 
-        status, records = _crawl_with_retry(crawler, retry_config)
+        status, records, error_info = _crawl_with_retry(crawler, retry_config)
+        error_kind = (error_info or {}).get("kind", "software")
+        error_detail = (error_info or {}).get("detail") or (records[0] if records else "未知错误")
 
         if status == "error":
             all_results.append(
@@ -456,19 +490,25 @@ def run_crawl_and_notify():
                     "site_name": site_name,
                     "site_key": site_key,
                     "status": "error",
-                    "message": f"爬取失败: {records[0] if records else '未知错误'}",
+                    "error_kind": error_kind,
+                    "message": error_detail,
                     "new_items": [],
                 }
             )
             continue
 
         if status == "empty":
+            if error_kind == "network":
+                message = f"网络异常: {error_detail}"
+            else:
+                message = error_detail
             all_results.append(
                 {
                     "site_name": site_name,
                     "site_key": site_key,
                     "status": "error",
-                    "message": "爬取结果为空，网站可能无法访问或结构已变化",
+                    "error_kind": error_kind,
+                    "message": message,
                     "new_items": [],
                 }
             )
@@ -539,7 +579,19 @@ def compose_email(results: list[dict]) -> tuple[str, str]:
 
         if status == "error":
             has_error = True
-            body_parts.append(f"{separator}\n【{site_name}】\n状态：异常\n{result['message']}\n")
+            kind = result.get("error_kind", "software")
+            if kind == "network":
+                body_parts.append(
+                    f"{separator}\n【{site_name}】\n状态：网络异常（非程序缺陷）\n"
+                    f"原因：{result['message']}\n"
+                    f"说明：程序无法连接到目标网站（DNS解析失败或连接超时），本次数据未更新\n"
+                    f"建议：请检查本机网络连接/DNS后，重新执行爬取即可恢复\n"
+                )
+            else:
+                body_parts.append(
+                    f"{separator}\n【{site_name}】\n状态：严重错误（爬虫程序异常，需要修复）\n"
+                    f"详情：{result['message']}\n"
+                )
         elif status == "normal":
             body_parts.append(f"{separator}\n【{site_name}】\n状态：正常\n{result['message']}\n")
         elif status == "update":
@@ -770,7 +822,9 @@ def test_compare_and_push():
         print(f"  标题: {deleted_title}")
         print(f"  链接: {deleted_url}")
 
-        status, records = _crawl_with_retry(crawler, retry_config)
+        status, records, error_info = _crawl_with_retry(crawler, retry_config)
+        error_kind = (error_info or {}).get("kind", "software")
+        error_detail = (error_info or {}).get("detail") or (records[0] if records else "未知错误")
 
         if status == "error":
             all_results.append(
@@ -778,7 +832,8 @@ def test_compare_and_push():
                     "site_name": site_name,
                     "site_key": site_key,
                     "status": "error",
-                    "message": f"爬取失败: {records[0] if records else '未知错误'}",
+                    "error_kind": error_kind,
+                    "message": error_detail,
                     "new_items": [],
                 }
             )
@@ -786,12 +841,17 @@ def test_compare_and_push():
             continue
 
         if status == "empty":
+            if error_kind == "network":
+                message = f"网络异常: {error_detail}"
+            else:
+                message = error_detail
             all_results.append(
                 {
                     "site_name": site_name,
                     "site_key": site_key,
                     "status": "error",
-                    "message": "爬取结果为空",
+                    "error_kind": error_kind,
+                    "message": message,
                     "new_items": [],
                 }
             )

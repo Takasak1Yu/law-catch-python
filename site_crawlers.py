@@ -1,9 +1,16 @@
 import os
+import sys
 import time
+import json
 import socket
+import threading
+import traceback
 import subprocess
 import requests
 import urllib3
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+from urllib.parse import urlsplit
 from bs4 import BeautifulSoup
 from abc import ABC, abstractmethod
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -11,6 +18,20 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CRAWLER_PORTS = [9223, 9224, 9225, 9226, 9227, 9228]
+
+
+def _thread_excepthook(args: threading.ExceptHookArgs):
+    """屏蔽 DrissionPage 在浏览器关闭时 _recv_loop 产生的 JSONDecodeError 噪音"""
+    tb = args.exc_traceback
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        if "chromium_driver.py" in code.co_filename and "_recv_loop" in code.co_name:
+            return
+        tb = tb.tb_next
+    traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+
+threading.excepthook = _thread_excepthook
 
 
 def wait_for_port_free(port: int, timeout: int = 30, interval: float = 1.0):
@@ -44,6 +65,70 @@ def kill_crawler_browsers():
     time.sleep(2)
 
 
+def http_get(url: str, headers: dict | None = None, timeout: int = 15) -> requests.Response:
+    """带自动重试的GET请求（针对偶发DNS解析失败/连接失败/超时/5xx提高成功率）"""
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=2,
+        status=2,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    with requests.Session() as session:
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session.get(url, headers=headers, timeout=timeout, verify=False)
+
+
+def classify_crawl_error(e: BaseException) -> str:
+    """沿异常链判断异常类型，返回 'network'（网络问题）或 'software'（程序缺陷）"""
+    network_types = (
+        requests.exceptions.RequestException,
+        urllib3.exceptions.HTTPError,
+        socket.timeout,
+        socket.gaierror,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    )
+    cur: BaseException | None = e
+    for _ in range(6):
+        if cur is None:
+            break
+        if isinstance(cur, network_types):
+            return "network"
+        cur = cur.__cause__ or cur.__context__
+    return "software"
+
+
+def check_site_reachable(url: str, timeout: int = 5) -> tuple[bool, str]:
+    """快速检测目标站点DNS解析与端口连通性，返回 (是否可达, 失败原因)"""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        if not host:
+            return True, ""
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False, f"DNS解析失败，无法解析域名 {parts.hostname}"
+    except OSError as e:
+        return False, f"地址解析异常: {e}"
+
+    last_err = ""
+    for info in infos[:3]:
+        addr = info[4]
+        try:
+            with socket.create_connection(addr[:2], timeout=timeout):
+                return True, ""
+        except OSError as e:
+            last_err = f"无法连接 {host}:{port}（{e}）"
+    return False, last_err or f"无法连接 {host}:{port}"
+
+
 class BaseCrawler(ABC):
     site_key: str = ""
     site_name: str = ""
@@ -64,7 +149,7 @@ class MeeGovCrawler(BaseCrawler):
     }
 
     def crawl(self) -> list[tuple[str, str]]:
-        resp = requests.get(self.IFRAME_URL, headers=self.HEADERS, timeout=15, verify=False)
+        resp = http_get(self.IFRAME_URL, self.HEADERS, timeout=15)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -91,7 +176,7 @@ class MeeGovGzkCrawler(BaseCrawler):
     }
 
     def crawl(self) -> list[tuple[str, str]]:
-        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15, verify=False)
+        resp = http_get(self.URL, self.HEADERS, timeout=15)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -187,7 +272,7 @@ class MeeGovGtfwSubCrawler(BaseCrawler):
         from urllib.parse import urljoin
 
         url = self.BASE_URL + self.SUB_PATH
-        resp = requests.get(url, headers=self.HEADERS, timeout=15, verify=False)
+        resp = http_get(url, self.HEADERS, timeout=15)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -254,7 +339,7 @@ class NifdcCrawler(BaseCrawler):
     def crawl(self) -> list[tuple[str, str]]:
         from urllib.parse import urljoin
 
-        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15, verify=False)
+        resp = http_get(self.URL, self.HEADERS, timeout=15)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -282,14 +367,14 @@ class NifdcCrawler(BaseCrawler):
 
 class NifdcZcfgCrawler(NifdcCrawler):
     site_key = "nifdc_zcfg"
-    site_name = "中检院法规政策"
-    URL = "https://www.nifdc.org.cn/nifdc/xxgk/zcfg/index.html"
+    site_name = "中检院法律法规"
+    URL = "https://www.nidc.org.cn/xxgk/zcfg/flfg/index.html"
 
 
 class NifdcGgtzhCrawler(NifdcCrawler):
     site_key = "nifdc_ggtzh"
-    site_name = "中检院公告通知"
-    URL = "https://www.nifdc.org.cn/nifdc/xxgk/ggtzh/index.html"
+    site_name = "中检院政策解读"
+    URL = "https://www.nidc.org.cn/xxgk/zcfg/zcjd/index.html"
 
 
 class NmpaCrawler(BaseCrawler):
@@ -466,7 +551,7 @@ class ShMsaCrawler(BaseCrawler):
     def crawl(self) -> list[tuple[str, str]]:
         from urllib.parse import urljoin
 
-        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15, verify=False)
+        resp = http_get(self.URL, self.HEADERS, timeout=15)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -500,7 +585,7 @@ class MemGovCrawler(BaseCrawler):
     def crawl(self) -> list[tuple[str, str]]:
         from urllib.parse import urljoin
 
-        resp = requests.get(self.URL, headers=self.HEADERS, timeout=15, verify=False)
+        resp = http_get(self.URL, self.HEADERS, timeout=15)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -538,7 +623,7 @@ class MemGovFdzdgkCrawler(BaseCrawler):
     def crawl(self) -> list[tuple[str, str]]:
         from urllib.parse import urljoin
 
-        resp = requests.get(self.IFRAME_SRC, headers=self.HEADERS, timeout=15, verify=False)
+        resp = http_get(self.IFRAME_SRC, self.HEADERS, timeout=15)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
 
